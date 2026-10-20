@@ -1,0 +1,15 @@
+services:
+  xhx2api:
+    build: .
+    container_name: tabbit2api-panel
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7867:7867"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # api_key（以及其它配置）只认 config.json，面板「配置」页改的就是这一份。
+      # 必须挂出来：不挂的话容器重建就把面板里改过的密钥丢了。宿主机先 cp config.example.json config.json。
+      - ./config.json:/app/config.json

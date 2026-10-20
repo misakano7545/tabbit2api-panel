@@ -1,0 +1,50 @@
+{
+  "listen": "127.0.0.1:7867",
+  "api_key": "",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "default_model": "default",
+  "cooldown": {
+    "plan_credit": "12h",
+    "soft_rate": "60s",
+    "soft_rate_max": "2h"
+  },
+  "schedule": {
+    "keepalive_hours": [
+      3
+    ],
+    "keepalive_enabled": true,
+    "balance_refresh_enabled": true,
+    "balance_refresh_minutes": 5
+  },
+  "upstream": {
+    "timeout_seconds": 120,
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "user_agent": "",
+    "client_version": "",
+    "base_intl": "",
+    "base_cn": ""
+  },
+  "pool": {
+    "max_in_flight": 3,
+    "breaker_threshold": 3,
+    "breaker_cooldown": "10m",
+    "breaker_cooldown_max": "2h",
+    "degrade_threshold": 5,
+    "degrade_cooldown": "10m",
+    "degrade_cooldown_max": "2h",
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 5,
+    "expiring_soon": "168h"
+  },
+  "session_sticky": {
+    "enabled": true,
+    "ttl": "30m",
+    "gc_interval": "5m"
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
+  }
+}

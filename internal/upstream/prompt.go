@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // 上游单次请求的字符上限：实测 20000 字符成功、25000 必失败，预算取 16000 留余量。
@@ -236,11 +237,14 @@ func messageText(raw json.RawMessage) string {
 // joinWithinBudget 先放系统指令（各自限 systemBudget），再按顺序放其余消息；
 // 超预算时从最早的开始丢，并明确告知模型历史被截断。
 func joinWithinBudget(systems, others []string) string {
+	// 单位必须是**字符**：预算（promptBudget/promptSingle/systemBudget）都是按字符定的，
+	// 用 len() 是字节数，中文一个字三字节，8k 汉字的单条消息会被判超预算整段丢掉——
+	// 实测表现为模型回一句「之前的对话内容没有传过来」。
 	sysText := strings.Join(systems, "\n\n")
-	if len(sysText) > systemBudget {
+	if utf8.RuneCountInString(sysText) > systemBudget {
 		sysText = clipText(sysText, systemBudget)
 	}
-	used := len(sysText)
+	used := utf8.RuneCountInString(sysText)
 	room := promptBudget - used
 	if room < 400 {
 		room = 400
@@ -251,12 +255,13 @@ func joinWithinBudget(systems, others []string) string {
 	dropped := 0
 	for _, block := range others {
 		block = clipText(block, promptSingle)
-		if bodyUsed+len(block)+2 > room {
+		n := utf8.RuneCountInString(block)
+		if bodyUsed+n+2 > room {
 			dropped++
 			continue
 		}
 		kept = append(kept, block)
-		bodyUsed += len(block) + 2
+		bodyUsed += n + 2
 	}
 	if dropped > 0 {
 		kept = append([]string{historyNote}, kept...)

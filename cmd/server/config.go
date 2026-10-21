@@ -63,7 +63,7 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流内空闲上限（持续吐数据不掐）；<=0 回落 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-		// UserAgent 出站 UA 覆盖；空 = 内置 xhx2api-panel。
+		// UserAgent 出站 UA 覆盖；空 = 内置浏览器 UA。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion Tabbit 没有客户端版本段（保留键只为兼容旧配置文件）。
 		ClientVersion string `json:"client_version"`

@@ -1,5 +1,5 @@
 services:
-  xhx2api:
+  tab2api:
     build: .
     container_name: tabbit2api-panel
     restart: unless-stopped

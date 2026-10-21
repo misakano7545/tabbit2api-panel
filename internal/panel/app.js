@@ -23,7 +23,7 @@ function clearKey() {
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let cfgLoaded = null;
-let logPin = true, logCh = 'all', loginID = '', loginTimer = null, pollFails = 0, refTimer = null;
+let logPin = true, logCh = 'all', refTimer = null;
 let usageHours = 72;                   // 账号池用量列窗口，由 overview 的 usage_hours 同步
 let ready = false;                       // 认证探测通过后才允许拉数据，避免把 401 当加载失败刷 toast
 
@@ -127,7 +127,7 @@ async function submitKey() {
 }
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', models: '模型', usage: '用量', packages: '积分构成', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', models: '模型', usage: '用量', packages: '额度构成', config: '配置', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -172,40 +172,126 @@ function usdRemain(a) {
   return Math.max(0, Number(a && a.limit_usd || 0) - Number(a && a.used_usd || 0));
 }
 
-// credTitle 额度列提示：解释数字是什么、以及「0」是什么。
+// credTitle 额度列提示：Tabbit 的额度是**百分比制**，说明清楚数字含义与重置时间。
 function credTitle(a) {
+  a = a || {};
   if (isUSD(a)) {
+    // 历史口径，仅老数据可能命中。
     const limit = Number(a.limit_usd || 0), used = Number(a.used_usd || 0);
-    return '国际版按量计费（美元）：已用 ' + fmtUSD(used) + ' / 额度 ' + fmtUSD(limit) +
-      '。上游 is_dollar_usage_billing=true，积分字段（credits_limit）恒 0，' +
-      '所以这一列不能按积分读——免费号是 $1 免费额度，不是无限。';
+    return '已用 ' + fmtUSD(used) + ' / 额度 ' + fmtUSD(limit) + '（历史美元口径）';
   }
-  return '剩余 / 总额（上游积分包）';
+  const used = Number(a.used_percent || 0);
+  const lines = ['上游只给「已用百分比」：剩余 ' + fmtPct(remainPct(a)) + '，已用 ' + fmtPct(used) + '。'];
+  if (a.member_level) lines.push('会员档位：' + a.member_level + '。');
+  if (a.reset_at) lines.push('下次重置：' + resetText(a.reset_at) + '（重置后已用归零）。');
+  if (a.reset_coupons) lines.push('额度重置券：' + a.reset_coupons + ' 张。');
+  return lines.join('\n');
 }
-// credCell 额度列单元格：只给一行「剩余 / 总额」；已用量与百分比在悬停提示（credTitle）里，
-// 单元格再压一行小字是重复。
+
+// remainPct 剩余百分比。
+//
+// 优先用上游原值算：100 - usage_percentage（保留小数，如 8.07% → 91.93%）。
+// 后端 credits 是 int64（91），拿它显示会把 91.93% 抹成 91%，所以只在没有
+// used_percent 时才回落到 credits。两者都没有 = 还没查到过 → null（显示 —）。
+function remainPct(a) {
+  a = a || {};
+  const used = Number(a.used_percent);
+  if (Number.isFinite(used) && (a.used_percent !== undefined && a.used_percent !== null)) {
+    return Math.max(0, Math.min(100, 100 - used));
+  }
+  if (!a.credit_unit && !a.credits && !a.credits_total) return null;
+  if (a.credits == null) return null;
+  return Math.max(0, Math.min(100, Number(a.credits)));
+}
+
+// fmtPct 百分比数字 + % 号：整数不带小数，带小数时保留 2 位（上游给的是 "0.89%"）。
+function fmtPct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return (Number.isInteger(n) ? String(n) : n.toFixed(2)) + '%';
+}
+
+// resetCountdown 生成站点同款文案：「6天21小时后重置」。
+//
+// 站点的写法是「N天M小时后重置」，不给分钟；不足 1 天时退到「M小时后重置」，
+// 不足 1 小时退到分钟，避免出现「0天0小时后重置」这种废话。
+function resetCountdown(unix) {
+  const secs = Number(unix) - Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(secs)) return '';
+  if (secs <= 0) return '即将重置';
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  const mins = Math.max(1, Math.floor((secs % 3600) / 60));
+  if (days > 0) return days + '天' + hours + '小时后重置';
+  if (hours > 0) return hours + '小时后重置';
+  return mins + '分钟后重置';
+}
+
+// resetText 重置倒计时（面板只做展示，不做换算）。
+function resetText(unix) {
+  const secs = Number(unix) - Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(secs) || secs <= 0) return '已到重置点';
+  const hours = Math.floor(secs / 3600);
+  if (hours >= 24) return Math.floor(hours / 24) + ' 天后';
+  if (hours >= 1) return hours + ' 小时后';
+  return Math.max(1, Math.floor(secs / 60)) + ' 分钟后';
+}
+
+// fmtResetAt 重置时刻（本地时间）+ 倒计时，给额度构成卡片用。
+function fmtResetAt(unix) {
+  const secs = Number(unix);
+  if (!Number.isFinite(secs) || secs <= 0) return '';
+  const d = new Date(secs * 1000);
+  const md = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+  return md + ' ' + String(d.getHours()).padStart(2, '0') + ':' +
+    String(d.getMinutes()).padStart(2, '0') + ' 重置';
+}
+
+// credCell 额度列单元格：直接显示「剩余百分比」并带 % 号。
+// Tabbit 没有积分，所以不再出现「剩余 / 总额」这种积分式写法。
 function credCell(a) {
-  a = a || {}; // 兜底：坏输入宁可渲染成 0/—，也不要抛异常把整张表打空
+  a = a || {}; // 兜底：坏输入宁可渲染成 —，也不要抛异常把整张表打空
   if (isUSD(a)) {
     const limit = Number(a.limit_usd || 0);
     return '<div class="n">' + esc(fmtUSD(usdRemain(a))) +
       (limit > 0 ? '<span class="tot">/' + esc(fmtUSD(limit)) + '</span>' : '') + '</div>';
   }
-  return '<div class="n">' + (a.credits || 0) +
-    (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div>';
+  const pct = remainPct(a);
+  if (pct == null) return '<div class="n muted">—</div>';
+  // 副行直接给站点同款倒计时，不用悬停也能看到（用户明确要看这个）。
+  const cd = a.reset_at ? resetCountdown(a.reset_at) : '';
+  return '<div class="n">' + esc(fmtPct(pct)) + '</div>' +
+    (cd ? '<span class="reset">' + esc(cd) + '</span>' : '');
 }
 
-// expCell 到期列：0 = 上游没给到期信息，不猜。临近/已过期才上标签，正常不动声色。
-function expCell(unix) {
-  if (!unix) return '<span style="color:var(--ink-3)">—</span>';
-  const d = new Date(unix * 1000);
-  const days = Math.ceil((d - Date.now()) / 86400000);
-  const md = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
-  let s = '<span class="num">' + md + '</span>';
-  if (days < 0) s += ' ' + tag('bad', '已过期');
-  else if (days <= 3) s += ' ' + tag('warn', '剩 ' + days + ' 天');
-  return s;
+// toMs 把「Unix 秒 / 毫秒」统一成毫秒。
+//
+// overview 里的 token_expires_at 实际是**毫秒**（如 1793143373000），而库里其他时间戳
+// （expire、reset_at）是秒。历史上前端一律 *1000，于是凭证到期被算成 58792 年
+// （老的「Token」列显示 6-14 就是这个 bug）。这里按数量级判定，两种都给对。
+function toMs(v) {
+  const n = Number(v || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 1e11 ? n : n * 1000;
 }
+
+// whoTitle 账号列的悬停提示。
+//
+// 「Token 到期」原来独占一列，现在收进这里：cookie 只有 7 天有效，过期要重新导入，
+// 这条信息不能丢，但也不值得占一列宽度——悬停即可。
+function whoTitle(a) {
+  a = a || {};
+  const lines = [a.nickname || a.uid, a.uid, a.realm === 'cn' ? '国内版 web.tabbit.com' : '国际版 web.tabbit.ai'];
+  const exp = toMs(a.token_expires_at);
+  if (exp > 0) {
+    const d = new Date(exp);
+    const days = Math.ceil((d - Date.now()) / 86400000);
+    lines.push('凭证到期：' + d.toLocaleString('zh-CN', {hour12: false}) +
+      (days <= 0 ? '（已过期，请重新导入）' : '（剩 ' + days + ' 天）'));
+  }
+  return lines.join('\n');
+}
+
 
 /* 用量列：与用量视图同源（近 usageHours 小时的台账汇总）。无调用记录时不显示假零——
    「0 次」会被读成「调过但失败了，这个号有问题」。 */
@@ -261,17 +347,19 @@ function renderAccounts(list) {
       // 凭证预览：只回 token 前缀与长度，用来确认「盘上这份是谁、什么时候过期」。
       '<button class="xs" data-a="cred" data-u="' + esc(a.uid) +
         '" title="看盘上这份凭证（脱敏）">凭证</button>',
+      // 单号签到：上游 sign-in 是真实接口，活动没开时上游会回 activity_open=false。
+      '<button class="xs" data-a="checkin" data-u="' + esc(a.uid) +
+        '" title="给这个号签今天的一次（不改额度口径）">签到</button>',
     ];
     if (a.cooling) acts.push('<button class="xs" data-a="clear-cooldown" data-u="' + esc(a.uid) + '">解除冷却</button>');
     if (a.disabled) acts.push('<button class="xs" data-a="enable" data-u="' + esc(a.uid) + '">启用</button>');
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
     acts.push('<button class="xs danger" data-a="remove" data-u="' + esc(a.uid) + '">移除</button>');
     return '<tr class="' + cls + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + esc(a.uid) + '</div></td>' +
+      '<td class="who" title="' + esc(whoTitle(a)) + '"><div class="nm">' + (a.realm === 'cn'
+        ? '<span class="tag mute">国内</span> ' : '<span class="tag mute">国际</span> ') + esc(a.nickname || a.uid) + '</div><div class="id">' + esc(a.uid) + '</div></td>' +
       '<td>' + st.join(' ') + '</td>' +
       '<td class="cred" title="' + esc(credTitle(a)) + '">' + credCell(a) + '</td>' +
-      '<td>' + expCell(a.expire) + '</td>' +
-      '<td>' + expCell(a.token_expires_at) + '</td>' +
       '<td class="num">' + (a.err_count || 0) + '</td>' +
       '<td class="num" title="累计成功 / 失败（自记录起）">' + (a.success_count || 0) +
         ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (a.err_total || 0) + '</span></td>' +
@@ -291,9 +379,15 @@ async function loadOverview(quiet) {
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
-    const cSum = list.reduce((s, a) => s + (isUSD(a) ? 0 : (a.credits || 0)), 0);
-    const cTot = list.reduce((s, a) => s + (isUSD(a) ? 0 : (a.credits_total || 0)), 0);
-    $('sCredits').textContent = cSum + (cTot ? '/' + cTot : '');
+    // 剩余额度：Tabbit 是百分比制，跨账号求和（94+98=192）没有意义，
+    // 顶栏给「平均剩余%」，逐账号明细在 title 里。
+    const pcts = list.map(a => remainPct(a)).filter(v => v != null);
+    const avg = pcts.length ? pcts.reduce((s, v) => s + v, 0) / pcts.length : null;
+    $('sCredits').textContent = avg == null ? '—' : fmtPct(Math.round(avg * 10) / 10);
+    $('sCredits').parentElement.title = pcts.length
+      ? list.filter(a => remainPct(a) != null)
+          .map(a => (a.nickname || a.uid) + ' ' + fmtPct(remainPct(a))).join('\n')
+      : '还没有查到额度';
     // 排程现状：只报下一次（时点是本地小时）。「已关」与「未排」都显示 —。
     const sch = d.schedule || {};
     $('sSchedule').textContent = sch.keepalive_next
@@ -887,9 +981,9 @@ function usDimHead(dim) {
     '<th class="num">请求</th><th class="num">失败</th>' +
     '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
     '<th class="num">缓存命中率</th>' +
-    '<th class="num" title="按官方计费公式推算：输入/输出/缓存命中 token × 各自单价（积分/百万）。' +
-    '上游 token_usage 帧里没有积分字段，所以这是估算，不是回报值；未收录单价的模型不计入。">' +
-    '积分≈</th>' +
+    '<th class="num" title="按官方计费公式推算：输入/输出/缓存命中 token × 各自单价。' +
+    '上游 token_usage 帧里没有额度字段，所以这是估算，不是回报值；未收录单价的模型不计入。">' +
+    '额度≈</th>' +
     (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
     '</tr>';
 }
@@ -1084,7 +1178,7 @@ function renderUsage(d) {
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
     usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft',
       t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本') +
-    usKpi(fmtCredits(t.credits).replace(/<[^>]+>/g, ''), '估算积分', 'c-warn',
+    usKpi(fmtCredits(t.credits).replace(/<[^>]+>/g, ''), '估算额度', 'c-warn',
       '按官方单价推算，不是上游回报值');
 
   // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）。
@@ -1124,6 +1218,7 @@ const CFG_MAP = {
   listen: ['listen'], auth_dir: ['auth_dir'], state_file: ['state_file'],
   // 排程（整段改动需重启）
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
+  checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'],
   balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   // 冷却与熔断
@@ -1152,8 +1247,8 @@ const CFG_MAP = {
 };
 // ARRAY_FIELDS 逗号分隔提交成 JSON 数组（后端是 []int）；BOOL_FIELDS 用 select 的
 // "true"/"false" 提交成 JSON 布尔——直接把字符串塞进 json 会让后端 Unmarshal 失败。
-const ARRAY_FIELDS = ['keepalive_hours'];
-const BOOL_FIELDS = ['keepalive_enabled', 'balance_refresh_enabled', 'session_sticky_enabled'];
+const ARRAY_FIELDS = ['keepalive_hours', 'checkin_hours'];
+const BOOL_FIELDS = ['keepalive_enabled', 'checkin_enabled', 'balance_refresh_enabled', 'session_sticky_enabled'];
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
@@ -1374,6 +1469,31 @@ function summarizeCreditDays(list, now) {
 }
 
 function renderExpiryDistribution(list, now) {
+  // 百分比制（Tabbit）：没有「批次/包」，到期分布图无从聚合。
+  // 改画「各账号剩余额度 + 下次重置」，别留一个空图让人以为加载失败。
+  const pctAccounts = (list || []).filter(a => a && !a.error && !isUSD(a) && !(a.packages || []).length);
+  if (pctAccounts.length && pctAccounts.length === (list || []).filter(a => a && !a.error).length) {
+    const colors = pkAccountColorMap(list);
+    const rows = pctAccounts.map(a => {
+      const pct = Math.max(0, Math.min(100, a.used_percent != null ? 100 - Number(a.used_percent) : Number(a.remain || 0)));
+      const color = colors.get(String(a.uid)) || 'var(--accent)';
+      const title = (a.nickname || a.uid) + '\n剩余 ' + fmtPct(pct) +
+        '\n已用 ' + fmtPct(a.used_percent != null ? a.used_percent : 100 - pct) +
+        (a.reset_at ? '\n下次重置 ' + pkExpiryDateTime(a.reset_at * 1000) + '（' + resetText(a.reset_at) + '）' : '');
+      return '<div class="pk-expiry-row"><span>' +
+        (a.reset_at ? esc(resetCountdown(a.reset_at).replace('后重置', '')) : '—') +
+        '</span><div class="pk-expiry-track"><span class="pk-expiry-seg" style="--seg-color:' + color +
+        ';flex:' + Math.max(0.008, pct / 100).toFixed(4) + ' 1 0" title="' + esc(title) + '"></span></div>' +
+        '<b>' + esc(fmtPct(pct)) + '</b></div>';
+    }).join('');
+    $('pkExpiry').innerHTML =
+      '<div class="pk-expiry-hdr"><span>下次重置</span>' +
+      '<span style="text-align:center">剩余额度（占 100%）</span><b>剩余</b></div>' +
+      '<div class="pk-expiry-chart">' + rows + '</div>' +
+      '<div class="pk-expiry-foot">上游按周计额度：只报「已用百分比」' +
+      '（usage_percentage），重置后归零。没有积分批次，所以不画到期分布。</div>';
+    return;
+  }
   const summary = summarizeCreditDays(list, now);
   const colors = pkAccountColorMap(list);
   const rows = summary.rows.map(row => {
@@ -1486,6 +1606,26 @@ function renderPackages(d) {
         '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
     }
     const usd = isUSD(a);
+    // Tabbit 是百分比制：没有「包」，remain/size 就是 剩余%/100%。
+    if (!usd && !(a.packages || []).length) {
+      // 用上游原值算，别用 int64 的 remain（会把 91.93% 抹成 91%）。
+      const used = Number(a.used_percent != null ? a.used_percent : Math.max(0, 100 - Number(a.remain || 0)));
+      const pct = Math.max(0, Math.min(100, 100 - used));
+      const remain = pct;
+      const bits = ['已用 ' + fmtPct(used)];
+      if (a.member_level) bits.push('档位 ' + a.member_level);
+      if (a.reset_at) bits.push(resetCountdown(a.reset_at) + '（' + fmtResetAt(a.reset_at) + '）');
+      if (a.used_reset_coupons) bits.push('重置券 ' + a.used_reset_coupons + ' 张');
+      return '<div class="pk-card">' +
+        '<div class="who"><span class="nm">' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</span>' +
+        '<span class="realm">' + esc(a.realm || '') + ' · 百分比制</span></div>' +
+        '<div class="big">' + esc(fmtPct(pct)) + '</div>' +
+        '<div class="sub">' + esc(bits.join(' · ')) + '</div>' +
+        '<div class="mixbar"><i style="width:' + pct.toFixed(2) + '%;background:' + pkColor(0) + '"></i></div>' +
+        '<div class="pk-legend"><span><i style="background:' + pkColor(0) + '"></i>剩余 ' + esc(fmtPct(pct)) +
+        ' </span><span><i style="background:var(--surface-2)"></i>已用 ' + esc(fmtPct(used)) + '</span></div>' +
+        '</div>';
+    }
     const srcs = pkBySource(a.packages || []);
     // 美元号的面额/剩余都是小数，格式与合计口径都要跟着换
     const money = v => (usd ? fmtUSD(v) : fmtTok(v));
@@ -1523,6 +1663,21 @@ function renderPackages(d) {
   // 逐包明细：每个账号一个表，包的**面额**列是重点
   $('pkDetail').innerHTML = list.map(a => {
     if (a.error) return '';
+    // 百分比制（Tabbit）：没有包明细，只给一张「剩余/已用」说明卡，而不是空表。
+    if (!isUSD(a) && !(a.packages || []).length) {
+      const usedPct = Number(a.used_percent != null ? a.used_percent : Math.max(0, 100 - Number(a.remain || 0)));
+      const remain = Math.max(0, Math.min(100, 100 - usedPct));
+      const bits = ['剩余 ' + fmtPct(remain), '已用 ' + fmtPct(usedPct)];
+      if (a.member_level) bits.push('会员档位 ' + a.member_level);
+      if (a.reset_at) bits.push(resetCountdown(a.reset_at) + '（' + fmtResetAt(a.reset_at) + '）');
+      if (a.used_reset_coupons) bits.push('额度重置券 ' + a.used_reset_coupons + ' 张');
+      return '<div class="box"><header><h3>' +
+        esc(a.nickname || String(a.uid || '').slice(0, 8)) + ' · ' + esc(a.realm || '') +
+        ' · 百分比制</h3><span class="grow"></span><span class="note">' + esc(bits.join(' · ')) +
+        '</span></header><div class="pad"><div class="hint">上游额度只给「已用百分比」' +
+        '（usage_percentage），没有积分包或金额分档，所以这一页不再列包明细。' +
+        '重置后已用归零。</div></div></div>';
+    }
     const groups = pkDetailGroups(a.packages || [], PK_DEFAULT_DETAIL_LIMIT);
     const rowOf = (p, rowGroup) => {
       const k = (p.group || '') + '|' + (p.name || '(未命名)');
@@ -1592,101 +1747,159 @@ async function loadPackages() {
   }
 }
 
-/* ── 添加账号（不轮询：贴回调地址换票）────────────────────────────── */
-// 地区：链接按地区切域（国内 www.trae.cn / 国际 www.trae.ai）。回调自带 OAuth host，
-// 所以换票那步不用再选一次——面板按 host 自动落 domain/apiHost。
+/* ── 添加账号：手机号 + 短信验证码（全程在面板里，不需要 Tabbit 浏览器）─────────
+   网关自己调上游的 send-verification-code / oauth/login，登录态从 Set-Cookie 拿，
+   所以用户只要填手机号和收到的验证码。第二个 tab 是「手动粘贴」，被风控挡住时的兜底。 */
 let addRealm = 'cn'; // 与弹窗里默认勾选的单选一致
-let addTab = 'browser';
+let addTab = 'sms';
+let smsSessionID = '';
+let smsResendTimer = null;
+let smsResendLeft = 0;
 
 // switchAddTab 主按钮跟着 tab 走：一屏只有一个「加入」，避免两个并列主 CTA 抢焦点。
+// 登录方式与地区绑定（不是偏好）：
+//   国内版 web.tabbit.com → 手机号登录（网关自己发码、自己收 Set-Cookie）
+//   国际版 web.tabbit.ai  → 凭证导入（Google 授权结果只在浏览器里产生，网关侧无法完成）
+// 「凭证导入」两边都能用。
+const TAB_FOR_REALM = { cn: 'sms', intl: 'token' };
+
+// allowedTabs 返回当前地区可用的登录方式。
+function allowedTabs() {
+  return addRealm === 'cn' ? ['sms', 'token'] : ['token'];
+}
+
+// syncAddTabs 按地区显隐 tab 并纠正当前选中项：
+// 切到国际版时不能把用户留在一个已隐藏的「手机号登录」面板上。
+function syncAddTabs() {
+  const allowed = allowedTabs();
+  document.querySelectorAll('#addTabs .tab').forEach(b => {
+    b.hidden = !allowed.includes(b.dataset.tab);
+  });
+  if (!allowed.includes(addTab)) addTab = TAB_FOR_REALM[addRealm] || allowed[0];
+  switchAddTab(addTab);
+}
+
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('addTabBrowser').hidden = tab !== 'browser';
+  $('addTabSms').hidden = tab !== 'sms';
   $('addTabToken').hidden = tab !== 'token';
+  $('btnSmsLogin').hidden = tab !== 'sms';
   $('btnRefreshLogin').hidden = tab !== 'token';
 }
 
-function openAdd() {
-  loginID = '';
-  stopLoginPoll();
-  addTab = 'browser';
-  switchAddTab(addTab);
-  $('addLoad').hidden = false;
-  $('addReady').hidden = true;
-  $('addErr').hidden = true;
-  $('btnCopyUrl').hidden = true;
-  $('btnOpenUrl').hidden = true;
-  $('addRefreshToken').value = '';
-  $('addVeil').classList.add('on');
-  api('login/start', { method: 'POST', body: JSON.stringify({ realm: addRealm }) }).then(d => {
-    loginID = d.id;
-    $('addUrl').textContent = d.url;
-    $('addUrl').title = d.url; // 单行截断，悬停看全
-    $('addLoad').hidden = true;
-    $('addReady').hidden = false;
-    $('btnCopyUrl').hidden = false;
-    $('btnOpenUrl').hidden = false;
-    switchAddTab(addTab);
-    // 授权页一打开就开始问：用户在任何时候完成授权，下一次轮询就收号（不用再点按钮）。
-    pollFails = 0;
-    loginTimer = setInterval(pollLogin, 3000);
-  }).catch(e => {
-    $('addLoad').hidden = true;
-    $('addErr').hidden = false;
-    $('addErr').textContent = e.message;
-  });
+function addErr(msg) {
+  $('addErr').hidden = false;
+  $('addErr').textContent = msg;
 }
 
-// refreshToken 直登：把一条 refreshToken 直接换成凭证（后端复用换票→取信息→落盘的同一路）。
+function clearAddErr() { $('addErr').hidden = true; }
+
+function openAdd() {
+  smsSessionID = '';
+  addTab = TAB_FOR_REALM[addRealm] || 'sms';
+  syncAddTabs();
+  clearAddErr();
+  $('addMobile').value = '';
+  $('addSmsCode').value = '';
+  $('addRefreshToken').value = '';
+  $('addSmsHint').textContent = '用平时登录 Tabbit 的手机号；验证码会发到该号码。';
+  resetSendCodeBtn();
+  $('addVeil').classList.add('on');
+  $('addMobile').focus();
+}
+
+function closeAdd() {
+  if (smsResendTimer) { clearInterval(smsResendTimer); smsResendTimer = null; }
+  smsSessionID = '';
+  $('addVeil').classList.remove('on');
+}
+
+// resetSendCodeBtn 把「获取验证码」按钮恢复成可点状态。
+function resetSendCodeBtn() {
+  if (smsResendTimer) { clearInterval(smsResendTimer); smsResendTimer = null; }
+  const btn = $('btnSendCode');
+  if (!btn) return;
+  btn.disabled = false;
+  btn.textContent = '获取验证码';
+}
+
+// startResendCooldown 倒计时：上游有频率限制，按钮先挡住，免得连点把号码打成风控。
+function startResendCooldown(seconds) {
+  smsResendLeft = Math.max(1, Number(seconds) || 60);
+  const btn = $('btnSendCode');
+  const tick = () => {
+    if (smsResendLeft <= 0) { resetSendCodeBtn(); return; }
+    btn.textContent = smsResendLeft + 's 后重发';
+    btn.disabled = true;
+    smsResendLeft -= 1;
+  };
+  if (smsResendTimer) clearInterval(smsResendTimer);
+  tick();
+  smsResendTimer = setInterval(tick, 1000);
+}
+
+// sendCode 第一步：让网关去上游发一条短信。
+async function sendCode() {
+  const mobile = $('addMobile').value.trim();
+  if (!/^\d{6,15}$/.test(mobile)) { addErr('手机号看起来不对（填纯数字，不带 +86）'); return; }
+  const btn = $('btnSendCode');
+  btn.disabled = true;
+  btn.textContent = '发送中…';
+  clearAddErr();
+  try {
+    const d = await api('login/start', { method: 'POST', body: JSON.stringify({ realm: addRealm, mobile }) });
+    smsSessionID = d.id || '';
+    const mins = Math.max(1, Math.ceil((Number(d.resend_in) || 60) / 60));
+    $('addSmsHint').textContent = '验证码已发送到 ' + mobile + '（' + mins + ' 分钟内可重发）';
+    startResendCooldown(d.resend_in || 60);
+    $('addSmsCode').focus();
+  } catch (e) {
+    resetSendCodeBtn();
+    addErr(e.message);
+  }
+}
+
+// smsLogin 第二步：验证码换登录态，落盘入池。
+async function smsLogin() {
+  const code = $('addSmsCode').value.trim();
+  if (!smsSessionID) { addErr('请先点「获取验证码」'); return; }
+  if (!code) { addErr('请填写收到的验证码'); return; }
+  const btn = $('btnSmsLogin');
+  btn.disabled = true;
+  btn.textContent = '登录中…';
+  clearAddErr();
+  try {
+    const d = await api('login/verify', { method: 'POST', body: JSON.stringify({ id: smsSessionID, code }) });
+    toast('已加入：' + (d.nickname || d.uid) + '（' + (d.realm === 'cn' ? '国内版' : '国际版') + '）', 'ok');
+    closeAdd();
+    loadOverview(true);
+  } catch (e) {
+    addErr(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录并加入';
+  }
+}
+
+// refreshLogin 手动粘贴：整串 cookie 走 import（能保留 user_id/SAPISID），裸 token 走 login/refresh。
 async function refreshLogin() {
-  const rt = $('addRefreshToken').value.trim();
-  if (!rt) { toast('先填一条 refreshToken', 'err'); return; }
+  const txt = $('addRefreshToken').value.trim();
+  if (!txt) { addErr('先粘贴 cookie 串或 token'); return; }
   const btn = $('btnRefreshLogin');
   btn.disabled = true;
+  clearAddErr();
   try {
-    const d = await api('login/refresh', { method: 'POST', body: JSON.stringify({ refresh_token: rt, realm: addRealm }) });
-    toast('已加入：' + (d.nickname || d.uid), 'ok');
-    $('addVeil').classList.remove('on');
+    const isCookie = txt.includes('=');
+    const d = isCookie
+      ? await api('accounts/import', { method: 'POST', body: JSON.stringify({ realm: addRealm, text: txt }) })
+      : await api('login/refresh', { method: 'POST', body: JSON.stringify({ token: txt, realm: addRealm }) });
+    toast(d.action === 'skipped_existing_newer'
+      ? '已存在更新的凭证，未覆盖' : '已加入：' + (d.nickname || d.uid), 'ok');
+    closeAdd();
     loadOverview(true);
   } catch (e) {
-    $('addErr').hidden = false;
-    $('addErr').textContent = e.message;
+    addErr(e.message);
   } finally { btn.disabled = false; }
-}
-
-function stopLoginPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
-
-// pollLogin 每 3s 问一次授权结果。连续失败不立刻放弃：OAuth 可能已在浏览器侧完成，
-// 停掉轮询账号就永远不入池。
-const POLL_MAX_FAILS = 20;
-async function pollLogin() {
-  if (!loginID) return;
-  try {
-    const d = await api('login/poll?id=' + encodeURIComponent(loginID));
-    pollFails = 0;
-    if (!d.done) return;
-    stopLoginPoll();
-    toast('已加入：' + (d.nickname || d.uid), 'ok');
-    $('addVeil').classList.remove('on');
-    loginID = '';
-    loadOverview(true);
-  } catch (e) {
-    if (e.status === 404 || e.status === 410) {
-      stopLoginPoll();
-      $('addErr').hidden = false;
-      $('addErr').textContent = '登录会话已过期，请关闭后重新添加';
-      return;
-    }
-    if (++pollFails >= POLL_MAX_FAILS) {
-      stopLoginPoll();
-      $('addErr').hidden = false;
-      $('addErr').textContent = '连续 ' + POLL_MAX_FAILS + ' 次查询失败，已停止轮询：' + e.message +
-        '（授权可能已完成，可关闭后重新添加）';
-      return;
-    }
-    $('addErr').hidden = false;
-    $('addErr').textContent = '网络中断，自动重试中（' + pollFails + '/' + POLL_MAX_FAILS + '）：' + e.message;
-  }
 }
 
 /* ── 启动 ─────────────────────────────────────────────────────────── */
@@ -1729,17 +1942,27 @@ function boot() {
   document.querySelectorAll('#addTabs .tab').forEach(b => {
     b.onclick = () => { addTab = b.dataset.tab; switchAddTab(addTab); };
   });
-  // 换地区就换一条链接，免得拿国内链接登国际号
+  // 换地区要重发验证码（两站的登录态不通用），所以清掉当前会话与已填的码。
   document.querySelectorAll('#addVeil input[name="addRealm"]').forEach(r => {
-    r.onchange = () => { addRealm = r.value; openAdd(); };
+    r.onchange = () => {
+      addRealm = r.value;
+      smsSessionID = '';
+      $('addSmsCode').value = '';
+      $('addSmsHint').textContent = '用平时登录 Tabbit 的手机号；验证码会发到该号码。';
+      resetSendCodeBtn();
+      clearAddErr();
+      syncAddTabs(); // 换地区就换登录方式（国内=手机号，国际=Google）
+    };
   });
-  $('btnAddClose').onclick = () => { stopLoginPoll(); loginID = ''; $('addVeil').classList.remove('on'); };
-  $('btnCopyUrl').onclick = () => {
-    if (navigator.clipboard) navigator.clipboard.writeText($('addUrl').textContent).catch(() => {});
-  };
-  // 新标签页打开：点击是用户手势，弹窗拦截不挡；noopener 不给新页面 window.opener 句柄。
-  $('btnOpenUrl').onclick = () => window.open($('addUrl').textContent, '_blank', 'noopener');
+  $('btnAddClose').onclick = closeAdd;
+  $('btnSendCode').onclick = sendCode;
+  $('btnSmsLogin').onclick = smsLogin;
   $('btnRefreshLogin').onclick = refreshLogin;
+  // 回车即下一步：手机号 → 发码，验证码 → 登录。
+  $('addMobile').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !$('btnSendCode').disabled) sendCode();
+  });
+  $('addSmsCode').addEventListener('keydown', e => { if (e.key === 'Enter') smsLogin(); });
   $('btnKey').onclick = submitKey;
   $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitKey(); });
 
@@ -1795,9 +2018,12 @@ function boot() {
       if (a === 'balance') {
         // Tabbit 只给用量百分比：剩余额度就是 100 - 已用。
         const acc = r.account;
-        toast('额度已刷新' + (acc ? '，剩余 ' + acc.credits + '%' : ''), 'ok');
+        toast('额度已刷新' + (acc ? '，剩余 ' + (remainPct(acc) == null ? '—' : fmtPct(remainPct(acc))) : ''), 'ok');
       } else if (a === 'clear-cooldown') toast('已解除冷却', 'ok');
-      else if (a === 'refresh') toast('这个号的 token 已换新' + (r.expires_at
+      else if (a === 'checkin') {
+        // 上游只回 sign_in_result；已签 / 成功都由 gateway 归一成 status。
+        toast(r.status ? '签到：' + r.status : '签到已执行' + (r.earned ? '，+' + r.earned : ''), 'ok');
+      } else if (a === 'refresh') toast('这个号的 token 已换新' + (r.expires_at
         ? '，到期 ' + new Date(r.expires_at * 1000).toLocaleString() : ''), 'ok');
       else if (a === 'disable') toast('已禁用', 'ok');
       else if (a === 'enable') toast('已启用', 'ok');

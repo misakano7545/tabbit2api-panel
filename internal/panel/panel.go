@@ -89,8 +89,8 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
-	// refreshToken 直登：不经过浏览器把号加进来（授权页只认浏览器本机的 127.0.0.1 回调，
-	// 公网回跳实测被拒，见 login.go 顶部——所以这条路是唯一的免粘贴方案）。
+	p.mux.HandleFunc("POST /panel/api/login/verify", p.withAuth(p.loginVerify))
+	// 手动粘贴 token 的兜底路径（自动化被风控挡住时用）。
 	p.mux.HandleFunc("POST /panel/api/login/refresh", p.withAuth(p.loginRefresh))
 	p.mux.HandleFunc("POST /panel/api/checkin", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/balance", p.withAuth(p.balanceAll))
@@ -215,7 +215,7 @@ type accountRow struct {
 	LastSuccess  time.Time `json:"last_success,omitempty"`
 	// ug 族设备指纹（签到/积分用的那套，按 uid + 种子派生）：面板展示 + 「换指纹」用。
 	// 9074 是设备维度风控，换一个设备号就能脱开旧标记（star620/TraeTools 的做法）。
-	// TokenExpiresAt access token 到期时刻（Unix 秒）。与 Status.Expire（积分包到期）不是
+	// TokenExpiresAt access token 到期时刻（Unix **毫秒**，来自 auth.ExpiresAt）。与 Status.Expire（积分包到期）不是
 	// 一回事：那个是「积分什么时候作废」，这个是「这张票还能用多久」。
 	TokenExpiresAt int64 `json:"token_expires_at,omitempty"`
 }
@@ -326,9 +326,18 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 	// 顺手按官方目录刷一次（10 分钟 TTL，失败静默回落到缓存/静态兜底）：
 	// 面板这一页是「官方此刻给了什么」的展示口，不应该只有重启才更新。
-	if a := p.cfg.Pool.Peek(); a != nil && p.cfg.Upstream != nil {
-		if _, err := p.cfg.Upstream.RefreshModels(a, false); err != nil {
-			log.Printf("panel: 模型目录刷新失败（用缓存/兜底）: %v", err)
+	// **每个有账号的站都要刷**：只刷 Peek() 那一个号，另一个站的模型会永远缺席
+	// （国内/国际两套目录完全不重叠，漏一个站等于漏一半模型）。
+	if p.cfg.Upstream != nil {
+		seen := map[string]bool{}
+		for _, a := range p.cfg.Pool.Accounts() {
+			if a == nil || seen[a.Realm()] {
+				continue
+			}
+			seen[a.Realm()] = true
+			if _, err := p.cfg.Upstream.RefreshModels(a, false); err != nil {
+				log.Printf("panel: %s 模型目录刷新失败（用缓存/兜底）: %v", a.Realm(), err)
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": p.cfg.Models()})
@@ -350,13 +359,20 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 		// 曾经这里叫 unit、overview 叫 credit_unit，前端 isUSD() 只认后者 →
 		// 构成视图里美元号被判成积分号，整张卡显示 0（= 用户看到的那个 0）。
 		// 同概念两个键名就是这类静默失效的来源，所以这里有 TestPackagesUnitKeyMatchesOverview 兜着。
-		CreditUnit string                   `json:"credit_unit"`
-		Remain     int64                    `json:"remain"`
-		Size       int64                    `json:"size"`
-		UsedUSD    float64                  `json:"used_usd,omitempty"`
-		LimitUSD   float64                  `json:"limit_usd,omitempty"`
-		Packages   []upstream.CreditPackage `json:"packages"`
-		Error      string                   `json:"error,omitempty"`
+		CreditUnit string `json:"credit_unit"`
+		Remain     int64  `json:"remain"`
+		Size       int64  `json:"size"`
+		// 百分比制的展示字段（Tabbit）：档位 / 下次重置 / 重置券。
+		MemberLevel      string                   `json:"member_level,omitempty"`
+		UsedPercent      float64                  `json:"used_percent,omitempty"`
+		ResetAt          int64                    `json:"reset_at,omitempty"`
+		CycleStart       string                   `json:"cycle_start,omitempty"`
+		CycleEnd         string                   `json:"cycle_end,omitempty"`
+		UsedResetCoupons int64                    `json:"used_reset_coupons,omitempty"`
+		UsedUSD          float64                  `json:"used_usd,omitempty"`
+		LimitUSD         float64                  `json:"limit_usd,omitempty"`
+		Packages         []upstream.CreditPackage `json:"packages"`
+		Error            string                   `json:"error,omitempty"`
 	}
 	list := p.cfg.Pool.List()
 	out := make([]item, 0, len(list))
@@ -375,9 +391,16 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			out = append(out, it)
 			continue
 		}
-		it.Packages = packs
+		// packs 为 nil（百分比制）时保留空切片：JSON 要发 [] 而不是 null，
+		// 否则前端拿到 null 还得各自兜底。
+		if packs != nil {
+			it.Packages = packs
+		}
 		it.CreditUnit = u.Unit
 		it.Remain, it.Size = u.Remain, u.Total
+		it.MemberLevel, it.UsedPercent = u.MemberLevel, u.UsedPercent
+		it.ResetAt, it.UsedResetCoupons = u.ResetAt, u.ResetCoupons
+		it.CycleStart, it.CycleEnd = u.CycleStart, u.CycleEnd
 		it.UsedUSD, it.LimitUSD = u.UsedUSD, u.LimitUSD
 		out = append(out, it)
 	}
@@ -715,6 +738,9 @@ func (p *Panel) refreshBalance(uid string) error {
 	}
 	p.cfg.Pool.SetBalance(uid, pool.Balance{
 		Unit: u.Unit, Remain: u.Remain, Total: u.Total,
+		UsedPercent: u.UsedPercent, MemberLevel: u.MemberLevel,
+		ResetAt: u.ResetAt, ResetCoupons: u.ResetCoupons,
+		CycleStart: u.CycleStart, CycleEnd: u.CycleEnd,
 		UsedUSD: u.UsedUSD, LimitUSD: u.LimitUSD,
 	}, u.Expire)
 	return nil

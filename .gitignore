@@ -36,3 +36,11 @@ __pycache__/
 # 任务输入文档
 tickets/
 reference_workbuddy2api/
+
+# 本机跑局域网/抓包用的配置（含 api_key，绝不入库）
+config.lan.json
+config.*.json
+
+# 构建产物
+/tabbit2api
+/tabbit2api.exe

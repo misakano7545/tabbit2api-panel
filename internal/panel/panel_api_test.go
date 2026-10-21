@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,10 @@ func newTestPanel(t *testing.T) (*Panel, *upstream.Client, *pool.Pool) {
 				"display_multiplier":1}]}`)
 		case "/api/commerce/quota/v1/usage":
 			_, _ = io.WriteString(w, `{"usage_percentage":12.5,"member_level":"free"}`)
+		case "/api/commerce/activity/v1/sign-in/status":
+			_, _ = io.WriteString(w, `{"results":[{"scene_code":"daily_sign_in","activity_open":true,"signed_today":false}]}`)
+		case "/api/commerce/activity/v1/sign-in":
+			_, _ = io.WriteString(w, `{"results":[{"scene_code":"daily_sign_in","sign_in_result":"success","usage_reward_result":"skipped"}]}`)
 		case "/api/v0/user/base-info":
 			_, _ = io.WriteString(w, `{"user_info":{"user_id":"u-1","nickname":"测试号"}}`)
 		default:
@@ -50,6 +55,72 @@ func newTestPanel(t *testing.T) (*Panel, *upstream.Client, *pool.Pool) {
 		Models: h.models, Usage: nil,
 	})
 	return pn, up, p
+}
+
+// smsFake 记录短信登录请求的关键字段，供断言用。
+type smsFake struct {
+	mu         sync.Mutex
+	lastMobile string
+	lastUUID   string
+	lastCode   string
+}
+
+func (f *smsFake) LastLoginMobile() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastMobile
+}
+
+// newTestPanelWithSMS 组装一个「支持短信登录」的假上游 + 面板。
+//
+// 假上游按真实契约回：send-verification-code 返回 {code:0}，oauth/login 用
+// Set-Cookie 下发 token（登录态就在响应头里，这是本仓必须读 header 的原因）。
+func newTestPanelWithSMS(t *testing.T) (*Panel, *smsFake, *pool.Pool) {
+	t.Helper()
+	fake := &smsFake{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/proxy/v0/oauth/send-verification-code":
+			var body struct {
+				Mobile string `json:"mobile"`
+				UUID   string `json:"uuid"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			fake.mu.Lock()
+			fake.lastMobile, fake.lastUUID = body.Mobile, body.UUID
+			fake.mu.Unlock()
+			_, _ = io.WriteString(w, `{"code":0,"error":null,"data":null}`)
+		case "/proxy/v0/oauth/login":
+			var body struct {
+				Mobile  string `json:"mobile"`
+				SmsCode string `json:"smsCode"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			fake.mu.Lock()
+			fake.lastMobile, fake.lastCode = body.Mobile, body.SmsCode
+			fake.mu.Unlock()
+			w.Header().Add("Set-Cookie", "token=sms-token-value; Path=/; HttpOnly")
+			w.Header().Add("Set-Cookie", "user_id=sms-uid; Path=/")
+			_, _ = io.WriteString(w, `{"success":true,"message":"登录成功","user_id":"sms-uid","access_token":"sms-token-value"}`)
+		case "/api/v0/user/base-info":
+			_, _ = io.WriteString(w, `{"user_info":{"id":"sms-uid","display_name":"短信号"}}`)
+		case "/chat/sign-key":
+			_, _ = io.WriteString(w, "test-sign-key")
+		case "/api/commerce/quota/v1/usage":
+			_, _ = io.WriteString(w, `{"usage_percentage":5,"member_level":"free"}`)
+		case "/proxy/v1/model_config/models":
+			_, _ = io.WriteString(w, `{"models":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	up := upstream.New()
+	up.SetHosts(srv.URL, srv.URL)
+	p := pool.New("")
+	pn := New(Config{Pool: p, Upstream: up, AuthDir: t.TempDir(), Version: "test"})
+	return pn, fake, p
 }
 
 // apiShim 把 /v1/models 的形状借给面板（面板只要一个 []map）。
@@ -110,9 +181,16 @@ func TestPackages(t *testing.T) {
 	if first["remain"].(float64) != 87 { // 100 - 12.5 已用
 		t.Errorf("remain = %v（应为剩余百分比）", first["remain"])
 	}
-	packs := first["packages"].([]any)
-	if len(packs) == 0 {
-		t.Fatalf("额度构成为空")
+	if first["size"].(float64) != 100 {
+		t.Errorf("size = %v（百分比制的分母恒为 100）", first["size"])
+	}
+	// Tabbit 没有积分包：不要再编「剩余额度/已用额度」两个假包出来。
+	if packs := first["packages"].([]any); len(packs) != 0 {
+		t.Errorf("packages = %v（百分比制应返回空列表）", packs)
+	}
+	// 已用百分比原值要透出，面板据此画进度条与提示。
+	if used := first["used_percent"].(float64); used != 12.5 {
+		t.Errorf("used_percent = %v（应为上游 usage_percentage 原值）", used)
 	}
 }
 
@@ -143,15 +221,83 @@ func TestImportCookie(t *testing.T) {
 	}
 }
 
-// Tabbit 没有设备码授权：login/start 如实报错，用户改走「导入凭证」。
-func TestDeviceLoginUnsupported(t *testing.T) {
+// 短信登录：发送验证码（start）由面板调上游；这里只验证「空手机号被拒」。
+func TestLoginStartRequiresMobile(t *testing.T) {
 	pn, _, _ := newTestPanel(t)
 	code, body := call(t, pn, http.MethodPost, "/panel/api/login/start", `{"realm":"cn"}`)
-	if code != http.StatusBadGateway {
+	if code != http.StatusBadRequest {
 		t.Fatalf("status = %d", code)
 	}
-	if !strings.Contains(fmt.Sprint(body["error"]), "导入账号") {
-		t.Errorf("错误文案应指向导入账号: %v", body["error"])
+	if !strings.Contains(fmt.Sprint(body["error"]), "手机号") {
+		t.Errorf("错误文案应提示填手机号: %v", body["error"])
+	}
+}
+
+// 短信登录第二步：验证码换 cookie → 落盘入池。假上游用 Set-Cookie 下发 token。
+func TestLoginVerifySavesAccount(t *testing.T) {
+	pn, up, p := newTestPanelWithSMS(t)
+	code, body := call(t, pn, http.MethodPost, "/panel/api/login/start",
+		`{"realm":"cn","mobile":"13800000000"}`)
+	if code != http.StatusOK {
+		t.Fatalf("start status = %d, body = %v", code, body)
+	}
+	id := fmt.Sprint(body["id"])
+	if id == "" || id == "<nil>" {
+		t.Fatalf("没有拿到会话 id: %v", body)
+	}
+	code, body = call(t, pn, http.MethodPost, "/panel/api/login/verify",
+		`{"id":"`+id+`","code":"123456"}`)
+	if code != http.StatusOK {
+		t.Fatalf("verify status = %d, body = %v", code, body)
+	}
+	if fmt.Sprint(body["realm"]) != "cn" {
+		t.Errorf("realm = %v（应为本站点 cn）", body["realm"])
+	}
+	if _, ok := p.Status("sms-uid"); !ok {
+		t.Fatalf("登录后应把账号入池（现有 %v）", p.List())
+	}
+	if got := up.LastLoginMobile(); got != "13800000000" {
+		t.Errorf("上游收到的手机号 = %q", got)
+	}
+}
+
+// 登录方式与地区绑定：手机号只服务国内站，国际站走凭证导入。
+// 越界组合在服务端就被挡住，这里验证拒绝的理由是人话（指向正确做法），
+// 而不是把上游的 noBetaPermission 直接甩给用户。
+func TestLoginMethodRealmBinding(t *testing.T) {
+	pn, _, _ := newTestPanelWithSMS(t)
+	cases := []struct {
+		name string
+		path string
+		body string
+		want string
+	}{
+		{"手机号登录跑国际版", "/panel/api/login/start", `{"realm":"intl","mobile":"14085551234"}`, "国内版"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, body := call(t, pn, http.MethodPost, tc.path, tc.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d（越界组合应被拒）", code)
+			}
+			msg := fmt.Sprint(body["error"])
+			if !strings.Contains(msg, tc.want) {
+				t.Fatalf("错误文案 = %q，应指向正确的地区", msg)
+			}
+		})
+	}
+}
+
+// 国内版手机号登录仍然可用（不要因为加了绑定把正常路径也挡了）。
+func TestSMSLoginStillWorksForCN(t *testing.T) {
+	pn, fake, _ := newTestPanelWithSMS(t)
+	code, body := call(t, pn, http.MethodPost, "/panel/api/login/start",
+		`{"realm":"cn","mobile":"13800000000"}`)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", code, body)
+	}
+	if got := fake.LastLoginMobile(); got != "13800000000" {
+		t.Errorf("上游收到手机号 = %q", got)
 	}
 }
 

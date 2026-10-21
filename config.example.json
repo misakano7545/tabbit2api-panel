@@ -10,6 +10,10 @@
     "soft_rate_max": "2h"
   },
   "schedule": {
+    "checkin_hours": [
+      9
+    ],
+    "checkin_enabled": true,
     "keepalive_hours": [
       3
     ],

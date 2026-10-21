@@ -131,7 +131,11 @@ func (p *Panel) accountImport(w http.ResponseWriter, r *http.Request) {
 		// 裸 JWT、`token=…; user_id=…` cookie 串都交给 PrepareAccount 自己识别。
 		payload["cookie"] = trim
 	}
-	creds, err := p.cfg.Upstream.PrepareAccount(r.Context(), payload, "")
+	realm, _ := payload["realm"].(string)
+	if realm == "" {
+		realm, _ = payload["region"].(string)
+	}
+	creds, err := p.cfg.Upstream.PrepareAccount(r.Context(), payload, realm)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, publicErr(err))
 		return

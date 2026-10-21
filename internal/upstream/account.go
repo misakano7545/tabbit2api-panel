@@ -1,28 +1,29 @@
-// account.go 账号侧口径：额度快照、登录态探活、凭证准备。
+// account.go 账号侧口径：额度快照、签到、登录态探活、凭证准备。
 //
-// Tabbit 的额度只有一个接口：GET /api/commerce/quota/v1/usage?user_id=…
-// 返回 usage_percentage（已用百分比）与 member_level（免费/Pro）。它没有签到、
-// 没有积分包、没有续期接口——所以这里把「额度」统一表达成百分比，不编造金额。
+// Tabbit 的额度接口是 GET /api/commerce/quota/v1/usage?user_id=…&timezone=…
+// （只按 user_id 查，不带 cookie 也能读；缺 user_id 直接 422），返回
+// usage_percentage（已用百分比）与 member_level（free / standard / pro）。
+// 签到是真实存在的运营功能：/api/commerce/activity/v1/sign-in{/status}。
 package upstream
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/misakano7545/tabbit2api-panel/internal/auth"
 )
 
-// 计量单位：Tabbit 只给用量百分比。
+// 计量单位：Tabbit 的额度就是**百分比**（上游只给 usage_percentage，没有积分/金额）。
 const (
 	UnitPercent = "%"
 	UnitCredit  = UnitPercent // 基线符号（面板额度页沿用）
-	UnitUSD     = "USD"
+	UnitUSD     = "USD"       // 历史遗留：Tabbit 不用
 )
 
 // EntUsage 是额度快照（面板/调度器共用）。
@@ -41,6 +42,15 @@ type EntUsage struct {
 	// UsedPercent 是上游 usage_percentage 原值（0-100）。
 	UsedPercent float64 `json:"used_percent,omitempty"`
 	MemberLevel string  `json:"member_level,omitempty"`
+	// ResetAt 是下一次额度重置时刻（Unix 秒）；0 = 上游没给。
+	// Tabbit 是百分比制：Remain/UsedPercent 就是全部信息，ResetAt 只用于展示倒计时。
+	ResetAt int64 `json:"reset_at,omitempty"`
+	// ResetCoupons 是「额度重置券」张数（上游 unused_reset_coupon_count）。
+	ResetCoupons int64 `json:"reset_coupons,omitempty"`
+	// CycleStart / CycleEnd 是上游原始周期字符串（形如 2026.10.21 / 2026.10.28），
+	// 面板直接展示「本周期 10.21–10.28」，不做时区换算。
+	CycleStart string `json:"cycle_start,omitempty"`
+	CycleEnd   string `json:"cycle_end,omitempty"`
 }
 
 // ExpireAt 返回到期时刻（毫秒）。
@@ -63,6 +73,7 @@ func (c *Client) FetchQuota(a *auth.Auth) (map[string]any, error) {
 	if uid := a.Snapshot().UID; uid != "" {
 		query.Set("user_id", uid)
 	}
+	query.Set("timezone", timezone())
 	url := base + QuotaPath
 	if encoded := query.Encode(); encoded != "" {
 		url += "?" + encoded
@@ -76,6 +87,15 @@ func (c *Client) FetchQuota(a *auth.Auth) (map[string]any, error) {
 		return nil, err
 	}
 	return payloadOf(status, body, "额度查询")
+}
+
+// timezone 返回额度接口要的时区名（上游按它算「今天」与重置时刻）。
+func timezone() string {
+	name := time.Local.String()
+	if name == "" || strings.EqualFold(name, "Local") {
+		return "Asia/Shanghai"
+	}
+	return name
 }
 
 // FetchPlan 返回额度节点：Tabbit 没有独立订阅接口，member_level 就在额度响应里。
@@ -114,6 +134,28 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 		UsedPercent: used,
 		MemberLevel: text(data, "member_level", "plan", "plan_name"),
 	}
+	// 重置倒计时：上游给 remaining_reset_minutes（分钟）；个别响应只给小时。
+	// 这里换算成**绝对时刻**存下来，前端据此实时倒计时——存「还剩多少分钟」会在两次
+	// 刷新之间越走越慢（面板上显示的倒计时会停住），绝对时刻不会。
+	if minutes, ok := int64Of(data["remaining_reset_minutes"]); ok && minutes > 0 {
+		usage.ResetAt = c.now().Add(time.Duration(minutes) * time.Minute).Unix()
+	} else if hours, ok := int64Of(data["remaining_reset_hours"]); ok && hours > 0 {
+		usage.ResetAt = c.now().Add(time.Duration(hours) * time.Hour).Unix()
+	}
+	// cycle_end 是「本次额度周期结束日」（形如 2026.10.28），没有 remaining_* 时当兜底：
+	// 上游的周期是按日切的，缺时刻就按当天 00:00 估，至少不会显示「无重置时间」。
+	if usage.ResetAt == 0 {
+		if end := text(data, "current_cycle_end", "currentCycleEnd"); end != "" {
+			if t, err := time.ParseInLocation("2006.1.2", end, time.Local); err == nil {
+				usage.ResetAt = t.AddDate(0, 0, 1).Unix()
+			}
+		}
+	}
+	usage.CycleStart = text(data, "current_cycle_start", "currentCycleStart")
+	usage.CycleEnd = text(data, "current_cycle_end", "currentCycleEnd")
+	if coupons, ok := int64Of(data["unused_reset_coupon_count"]); ok {
+		usage.ResetCoupons = coupons
+	}
 	a.SetQuota(used)
 	return usage, nil
 }
@@ -124,17 +166,17 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err er
 	return u.Remain, u.Total, u.Expire, err
 }
 
-// BalancePackages 返回面板额度页需要的明细。
+// BalancePackages 返回额度构成。
+//
+// Tabbit 的额度是**百分比制**（usage_percentage），没有积分包/金额包这个概念，
+// 所以这里返回空列表 + 归一好的 EntUsage，由面板直接画「剩余/已用」而不是编出
+// 两个假包（曾经的「剩余额度/已用额度」两个包就是这么来的，读起来像积分）。
 func (c *Client) BalancePackages(a *auth.Auth) ([]CreditPackage, EntUsage, error) {
 	usage, err := c.UserEntUsageDetail(a)
 	if err != nil {
 		return nil, EntUsage{}, err
 	}
-	packs := []CreditPackage{
-		{Name: "剩余额度", Credits: usage.Remain, Unit: UnitPercent},
-		{Name: "已用额度", Credits: int64(usage.UsedPercent + 0.5), Unit: UnitPercent},
-	}
-	return packs, usage, nil
+	return nil, usage, nil
 }
 
 // CreditPackages 是 BalancePackages 的老签名。
@@ -143,24 +185,175 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	return packs, usage.Remain, usage.Expire, err
 }
 
-// CheckinStatus 是基线的「签到状态」接口：Tabbit 没有签到，enable=false 让调度器
-// 如实跳过整轮（而不是每轮空打一次上游然后报「复核未通过」）。
-func (c *Client) CheckinStatus(*auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
-	return false, 0, false, nil
+// CheckinStatus 查签到状态：GET /api/commerce/activity/v1/sign-in/status。
+//
+// 上游按 scene_code 分别记：daily_sign_in（每日签到）与 desktop_pet（养宠）。
+// 网关只关心 daily_sign_in：activity_open=false 时返回 enable=false，让调度器
+// 如实跳过整轮，而不是每轮空打一次上游。
+func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
+	data, err := c.signInStatus(a)
+	if err != nil {
+		return false, 0, true, err
+	}
+	results, _ := data["results"].([]any)
+	for _, raw := range results {
+		entry, _ := raw.(map[string]any)
+		if entry == nil || text(entry, "scene_code") != "daily_sign_in" {
+			continue
+		}
+		return text(entry, "signed_today") == "true" || boolOf(entry["signed_today"]),
+			0, boolOf(entry["activity_open"]), nil
+	}
+	return false, 0, true, nil
 }
 
-// CheckinClaim 在 Tabbit 上等价于「重新查一次额度」：没有可领取的东西，不伪造收益。
+// CheckinClaim 真正签一次：POST /api/commerce/activity/v1/sign-in。
+//
+// body（实测）: {"request_no":"<uuid>","scene_codes":["daily_sign_in"],"usage_percentage":"0.00%"}
+// 返回里的 usage_reward_result 是奖励口径（"skipped" = 没中奖），不是额度，
+// 所以这里只报告「签没签成功」，不编造收益。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
-	_, err := c.UserEntUsageDetail(a)
-	return err
+	percent := "0.00%"
+	if used, err := c.UserEntUsageDetail(a); err == nil {
+		percent = fmt.Sprintf("%.2f%%", used.UsedPercent)
+	}
+	body, err := json.Marshal(map[string]any{
+		"request_no":       randomUUID(),
+		"scene_codes":      []string{"daily_sign_in"},
+		"usage_percentage": percent,
+	})
+	if err != nil {
+		return &Error{Kind: ErrServer, Status: 500, Msg: "构造签到请求失败"}
+	}
+	data, err := c.postJSON(a, SignInPath, string(body), "/member/usage", "签到")
+	if err != nil {
+		return err
+	}
+	results, _ := data["results"].([]any)
+	for _, raw := range results {
+		entry, _ := raw.(map[string]any)
+		if entry == nil || text(entry, "scene_code") != "daily_sign_in" {
+			continue
+		}
+		switch text(entry, "sign_in_result") {
+		case "success", "already_signed":
+			return nil
+		case "":
+			return nil // 上游没给结论：不谎报成功也不判失败
+		default:
+			return &Error{Kind: ErrClient, Status: 400,
+				Msg: fmt.Sprintf("签到未成功：%s", text(entry, "sign_in_result"))}
+		}
+	}
+	return nil
+}
+
+// signInStatus 拉一次签到状态（面板只读展示也走这里）。
+func (c *Client) signInStatus(a *auth.Auth) (map[string]any, error) {
+	base := c.BaseFor(a.Realm())
+	query := url.Values{}
+	for _, scene := range []string{"daily_sign_in", "desktop_pet"} {
+		query.Add("scene_codes", scene)
+	}
+	target := base + SignInStatusPath + "?" + query.Encode()
+	req, err := c.signedRequest(http.MethodGet, target, "", "/member/usage", a, c.baseHeaders(a, "/member/usage"))
+	if err != nil {
+		return nil, err
+	}
+	status, body, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	return payloadOf(status, body, "签到状态查询")
+}
+
+// postJSON 是「带 cookie 的 JSON POST + 归一到 map」的公用路径。
+func (c *Client) postJSON(a *auth.Auth, path, bodyRaw, referer, action string) (map[string]any, error) {
+	base := c.BaseFor(a.Realm())
+	req, err := c.signedRequest(http.MethodPost, base+path, bodyRaw, referer, a, c.baseHeaders(a, referer))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	status, body, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	return payloadOf(status, body, action)
+}
+
+// boolOf 把 true / "true" / 1 归一成 bool。
+func boolOf(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
+	case json.Number:
+		n, _ := v.Int64()
+		return n != 0
+	case float64:
+		return v != 0
+	}
+	return false
+}
+
+// extractCookie 从「随手复制的一段东西」里挖出 cookie 串。
+//
+// 用户手里最常有的是这几种，逐个别名匹配比要求他们改格式友好得多：
+//
+//	curl 'https://web.tabbit.ai/...' -H 'Cookie: token=...; user_id=...'   （DevTools → Copy as cURL）
+//	Cookie: token=...; user_id=...                                        （Copy as cURL 的单行）
+//	-b 'token=...; user_id=...'
+//	token=...; user_id=...                                                （直接粘 cookie）
+//
+// 找不到就原样返回，让后面的 Parse 去判断（裸 JWT 走那条路）。
+func extractCookie(raw string) string {
+	text := strings.TrimSpace(raw)
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "cookie:") {
+		if idx := strings.Index(lower, "cookie:"); idx >= 0 {
+			rest := text[idx+len("cookie:"):]
+			// cookie 串到引号/换行/回车为止
+			if end := strings.IndexAny(rest, "\"'\r\n"); end >= 0 {
+				rest = rest[:end]
+			}
+			if v := strings.TrimSpace(rest); strings.Contains(v, "=") {
+				return v
+			}
+		}
+	}
+	if idx := strings.Index(lower, " -b "); idx >= 0 || strings.HasPrefix(lower, "-b ") {
+		if idx < 0 {
+			idx = 0
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(text[idx+3:], "-b "))
+		// 参数可能带引号：先吃掉开引号，再截到闭引号/换行。
+		if rest != "" && (rest[0] == '\'' || rest[0] == '"') {
+			quote := rest[0]
+			rest = rest[1:]
+			if end := strings.IndexByte(rest, quote); end >= 0 {
+				rest = rest[:end]
+			}
+		} else if end := strings.IndexAny(rest, " \t\r\n"); end >= 0 {
+			rest = rest[:end]
+		}
+		if v := strings.TrimSpace(rest); strings.Contains(v, "=") {
+			return v
+		}
+	}
+	return text
 }
 
 // PrepareAccount 把面板粘贴的内容变成账号：账号 JSON、cookie 串或裸 token。
 //
-// payload 来自面板的导入端点：
+// payload 来自面板的导入端点：{"token":"eyJ…","user_id":"…","realm":"intl"} 或
+// {"cookie":"token=…; user_id=…"}。
 //
-//	{"token":"eyJ…","user_id":"…","realm":"intl"}
-//	{"cookie":"token=…; user_id=…"}
+// realm 为空时按账号记录里的 realm/region 字段，再为空就**自动识别**：
+// 先按国际站验一次，401/403 说明这个号不属于该站，再换国内站验。
+// 两站的 token 不通用（国内 token 打国际站只会 401），所以自动识别是安全的：
+// 验不过的那个站不会被误判成「登录态失效」。
 func (c *Client) PrepareAccount(_ context.Context, payload map[string]any, realm string) (*auth.Auth, error) {
 	raw := text(payload, "token", "cookie", "access_token", "text")
 	if raw == "" {
@@ -170,26 +363,56 @@ func (c *Client) PrepareAccount(_ context.Context, payload map[string]any, realm
 	if cookie := text(payload, "cookie"); cookie != "" {
 		raw = cookie
 	}
-	body := raw
-	if !strings.HasPrefix(strings.TrimSpace(body), "{") {
-		// 裸 token / cookie 串交给 auth.Parse 的自由格式分支。
-		account, err := auth.Parse([]byte(body))
+	// 允许直接粘 cURL / 请求头块 / 整段 DevTools 输出：从中挖出 cookie。
+	raw = extractCookie(raw)
+	if realm == "" {
+		realm = text(payload, "realm", "region")
+	}
+	parse := func() (*auth.Auth, error) {
+		account, err := auth.Parse([]byte(raw))
 		if err != nil {
 			return nil, &Error{Kind: ErrClient, Status: 400, Msg: err.Error()}
 		}
-		if realm != "" {
-			account.Data.Realm = normalizeRealm(realm)
-		}
-		return c.verifyAccount(account)
-	}
-	account, err := auth.Parse([]byte(body))
-	if err != nil {
-		return nil, &Error{Kind: ErrClient, Status: 400, Msg: err.Error()}
+		return account, nil
 	}
 	if realm != "" {
+		account, err := parse()
+		if err != nil {
+			return nil, err
+		}
 		account.Data.Realm = normalizeRealm(realm)
+		return c.verifyAccount(account)
 	}
-	return c.verifyAccount(account)
+	// 自动识别：国际 → 国内。只有「登录态失效」才换站重试，网络/服务错误照实报。
+	intlAccount, err := parse()
+	if err != nil {
+		return nil, err
+	}
+	intlAccount.Data.Realm = auth.RealmIntl
+	verified, err := c.verifyAccount(intlAccount)
+	if err == nil {
+		return verified, nil
+	}
+	if !isSessionDead(err) {
+		return nil, err
+	}
+	cnAccount, err2 := parse()
+	if err2 != nil {
+		return nil, err2
+	}
+	cnAccount.Data.Realm = auth.RealmCN
+	if verifiedCN, errCN := c.verifyAccount(cnAccount); errCN == nil {
+		return verifiedCN, nil
+	}
+	return nil, err // 两个站都不认：回第一个错误（更可能是用户真正要用的那个站）
+}
+
+// isSessionDead 判断错误是不是「登录态不属于这个站/已失效」。
+func isSessionDead(err error) bool {
+	if e, ok := err.(*Error); ok {
+		return e.Kind == ErrSessionDead
+	}
+	return false
 }
 
 // verifyAccount 用 base-info 验证 cookie 可用，并补齐昵称。
@@ -219,40 +442,6 @@ func normalizeRealm(realm string) string {
 		return auth.RealmCN
 	}
 	return auth.RealmIntl
-}
-
-// DeviceLogin Tabbit 没有设备码流程：面板「添加账号」点它会拿到这条提示，
-// 让人改用「导入账号」粘贴 cookie。
-type DeviceLogin struct {
-	url   string
-	realm string
-}
-
-// ErrDeviceLoginUnsupported 说明 Tabbit 不走设备码授权。
-var ErrDeviceLoginUnsupported = errors.New(
-	"Tabbit 没有设备码授权：请在 Tabbit 浏览器里登录后按 F12 → Application → Cookies → https://web.tabbit.ai，" +
-		"复制 token 与 user_id（或整串 cookie）粘贴到「导入账号」")
-
-// NewDeviceLogin 固定返回不支持（保留基线调用点：面板 login.go 原样复用）。
-func NewDeviceLogin(client *Client, realm, _ string) (*DeviceLogin, error) {
-	if client == nil {
-		return nil, ErrDeviceLoginUnsupported
-	}
-	return &DeviceLogin{url: client.BaseFor(realm), realm: normalizeRealm(realm)}, ErrDeviceLoginUnsupported
-}
-
-// State 返回会话标识（基线面板拿它当 id）。
-func (d *DeviceLogin) State() string { return "tabbit-manual" }
-
-// Realm 返回地区。
-func (d *DeviceLogin) Realm() string { return d.realm }
-
-// AuthURL 返回登录页地址，供人工打开。
-func (d *DeviceLogin) AuthURL() string { return d.url }
-
-// Poll 不轮询：Tabbit 靠人工粘贴 cookie。
-func (d *DeviceLogin) Poll(context.Context) (*auth.Auth, bool, error) {
-	return nil, false, ErrDeviceLoginUnsupported
 }
 
 // ParseCallbackCode 在 Tabbit 没有回调链接，保留符号让基线调用点编译通过。

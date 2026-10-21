@@ -22,19 +22,20 @@
 
 | 能力 | 上游 | 说明 |
 |---|---|---|
-| 对话 | `POST /api/v1/chat/completion` | **一段纯文本进、SSE 文本流出**：没有 messages 数组，也没有原生 tool_calls |
-| 会话 | `POST /panel/session` | 取 `chat_session_id`，同一账号复用（30 分钟 TTL） |
-| 目录 | `GET /proxy/v1/model_config/models` | `selected_model` 只认目录里的 **display_name**，发 slug 会被静默换模型 |
-| 额度 | `GET /api/commerce/quota/v1/usage` | 只有 `usage_percentage`（已用百分比）与 `member_level`，没有金额 |
-| 签名 | `GET /chat/sign-key` | 动态 key；`x-nonce = HMAC-SHA256(key, "{ts}.{uuid}.{sha256(body)}")`，`x-signature` 是那个 uuid（名字反直觉，按线上行为为准） |
-| 登录 | 浏览器 cookie | `token`（HttpOnly JWT）+ `user_id`；**没有续期接口**，过期只能重新导出 |
+| 对话 | `POST /api/v3/chat/rooms/{room}/join` + `/runs` | **v3 房间协议**：先 join 订阅 SSE，再向 runs 投递消息；正文仍是纯文本，没有原生 tool_calls（旧 `/api/v1/chat/completion` 已不在 Web UI 里使用） |
+| 会话 | `POST /panel/session` | 取 `chat_session_id`（= 房间 id），同一账号复用（30 分钟 TTL） |
+| 目录 | `GET /proxy/v1/model_config/models` | `selected_model` 只认目录里的 **display_name**，发 slug 会被静默换模型；`selected_model` 是**数组** |
+| 额度 | `GET /api/commerce/quota/v1/usage?user_id=…&timezone=…` | **百分比制**：只有 `usage_percentage`（已用 %）与 `member_level`、`remaining_reset_minutes`、`unused_reset_coupon_count`；没有积分包/金额。只按 user_id 查，不带 cookie 也能读 |
+| 签到 | `POST /api/commerce/activity/v1/sign-in`（+`/status`） | 真实运营功能：`{request_no, scene_codes:["daily_sign_in"], usage_percentage}` → `sign_in_result` |
+| 签名 | `GET /chat/sign-key` | 动态 key；`x-nonce = HMAC-SHA256(key, "{ts}.{uuid}.{sha256(body)}")`，`x-signature` 是那个 uuid（**只有 join 带签名**，runs 不签）。两站 key 不同：intl `f8d0e6a7…`、cn `3a9b1c8d…` |
+| 登录 | 浏览器 cookie | `token`（RS256 JWT，7 天）+ `user_id`；**没有续期接口**，过期只能重新导出 |
 
 网关做五件事：选号、把请求摊成上游能吃的一段 prompt、把工具声明编译成文本协议并在回包里还原、
 把 SSE 翻译成 OpenAI chunk、把「请求本身被拒」与「账号故障」分开。下游三套协议因此只认一种线上形状。
 
 ### 两个必带头
 
-- `x-req-ctx`：base64 的客户端版本号（`MS42LjIwKDEwMTA2MDIwKQ==` = `1.6.20(10106020)`）。格式不对上游判 493「版本过低」。
+- `x-req-ctx`：base64 的客户端版本号（`MS4xNy4xNigxMDExNzAxNik=` = `1.17.16(10117016)`）。格式不对上游判 493「版本过低」。
 - `unique-uuid`：客户端自证标记。第 5 位是「是否默认浏览器」，位置 `[2,7,11,14,18,21,25,28]` 编码当前时间。
   本仓默认如实填 **非默认浏览器**——标记为真是上游认可的 Pro 自证路径，伪造等于冒充付费用户。
 
@@ -62,16 +63,26 @@ Docker：`docker compose up -d --build`（`auths/`、`data/`、`config.json` 都
 
 ## 加账号
 
-Tabbit 没有设备码授权、没有 refresh token，唯一入口是**浏览器 cookie**：
+面板「添加账号」有两条路，都在网关进程里完成，不需要网关机器上有浏览器：
 
-1. 在 Tabbit 浏览器里登录；
-2. DevTools → Application → Cookies → `https://web.tabbit.ai`；
-3. 复制 `token` 与 `user_id`，拼成 `token=…; user_id=…`，粘到面板「导入凭证」；
-   也可以直接粘账号 JSON：`{"token":"eyJ…","user_id":"…","nickname":"Tabbit-1","realm":"intl"}`。
+| 路径 | 适用 | 网关做什么 |
+|---|---|---|
+| **手机号登录** | 国内站（web.tabbit.com） | 自己发 `send-verification-code` / `oauth/login`，读响应 Set-Cookie 里的 `token` 等五项，校验后落盘入池 |
+| **凭证导入** | 两站通用（国际站唯一入口） | 粘 DevTools 的 **Copy as cURL** 整段、`token=…; user_id=…`、账号 JSON 或裸 JWT，自动挑出 Cookie |
 
-导入时网关会用 `/api/v0/user/base-info` 验一次登录态，验不过不会落盘。账号文件在
-`auths/<uid>.json`（0600，原子写）。`realm` 是 `intl`（web.tabbit.ai）或 `cn`（web.tabbit.com），
-决定这个号走哪个站——国内外模型重名，混着用会拿到「没有该模型权限」。
+地区与登录方式是绑定的，界面会按地区只显示可用那条：国内版 → 手机号登录；国际版 → 凭证导入。
+越界组合在服务端也会被拒（错误文案直接告诉你该用哪个）。
+
+### 为什么国际站没有「自动登录」
+
+Google 只把授权结果投递给 OAuth client 登记的 `redirect_uri`，而 Tabbit 那个
+`client_id` 对所有网关能接到的地址都回 `redirect_uri_mismatch`（loopback / localhost /
+`postmessage` / 站点自身路径全试过，见 `docs/tabbit-live-capture.md` §13）；
+国际站的手机号登录又处在上游灰度里（`403 auth.noBetaPermission`）。
+所以国际号只能把**已有的**登录态搬进来——`Copy as cURL` 整段粘贴是最省事的一种。
+
+> 只贴 `token` 不够：实测单独 `Cookie: token=…` 会被判 401「无权限」，必须带整串
+> （`user_id` / `SAPISID` / `managed` / `NEXT_LOCALE`）。面板的导入会自己挑全。
 
 ## 配置
 
@@ -88,7 +99,7 @@ Tabbit 没有设备码授权、没有 refresh token，唯一入口是**浏览器
 | `cooldown.plan_credit` / `soft_rate` / `soft_rate_max` | `12h/60s/2h` | 权益（492）、限流冷却与退避封顶 |
 | `pool.*` | 见示例 | 在途上限、熔断/降权阈值、闲置补偿 |
 | `schedule.keepalive_hours` | `[3]` | 每日探活时点 |
-| `schedule.checkin_*` | — | **不生效**：Tabbit 没有签到接口，保留键只为旧配置不报错 |
+| `schedule.checkin_hours` / `checkin_enabled` | `[9]` / `true` | 每日签到时点（上游 sign-in 接口；活动没开时上游回 `activity_open=false`，这一轮跳过） |
 
 ## 接到客户端
 
@@ -136,9 +147,15 @@ wire_api = "responses"
   网关按 16000 字符预算裁剪：系统指令优先，其余从最近往回填，并明确告知模型「历史已截断」。
 - **图片**：上游只接受文本。带图的请求会把图片标成「未被读取」的文字占位，**不假装看得见**。
 - **usage**：上游实测很少给 token 数，网关不编造——拿到才透出，拿不到就是 0。
+- **额度是百分比制**：上游只报「已用 %」，面板按 `剩余 = 100 - 已用` 显示（如 `91.93%`），
+  并在下面给出与站点一致的倒计时（`6天21小时后重置`）。倒计时按**绝对重置时刻**算
+  （由上游 `remaining_reset_minutes` 换算并持久化），所以两次刷新之间也不会停住或漂移。
 - **错误口径**：401 探活失败计 session 失效（连续达阈值才禁用），429 软冷却，5xx 熔断换号；
   请求本身被上游拒（其余 4xx）不换号，照实回上游状态码与原话。流里 `{"error":…}` 不算成功（会触发换号）。
-- **没有的能力**：签到、积分/签到收益、设备指纹轮换、refresh token 续期——上游没有，面板也不再提供入口。
+- **没有的能力**：设备指纹轮换、refresh token 续期——上游没有，面板也不提供入口。
+  （签到**有**：`/api/commerce/activity/v1/sign-in`，面板行内「签到」按钮 + 每日排程，活动未开时如实跳过。）
+- **代理**：HTTP(S)_PROXY / NO_PROXY 生效（`New()` 里的 Transport 显式设了 `ProxyFromEnvironment`）。
+  直连 web.tabbit.ai 会拿到 CDN 的 HTML 403（表现为「登录态失效」），所以走代理是常见前提。
 
 ## 开发
 

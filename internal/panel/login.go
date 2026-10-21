@@ -16,22 +16,37 @@ import (
 	"github.com/misakano7545/tabbit2api-panel/internal/upstream"
 )
 
+// 登录：手机号 + 短信验证码，全程在面板里完成。
+//
+// 为什么不再让用户去浏览器抄 cookie：Tabbit 的登录接口（send-verification-code +
+// oauth/login）本来就吃纯 HTTP，登录态通过 **Set-Cookie** 下发。网关自己发这两个请求
+// 就能拿到和浏览器一模一样的那份 cookie，用户只需填手机号和收到的验证码——不需要
+// Tabbit 浏览器，也不需要开 F12 抄 2.4KB 字符串。
 const (
-	loginTTL = 15 * time.Minute
+	loginTTL = 10 * time.Minute
+	// codeCooldown 是「重发验证码」的最小间隔：上游本身有频率限制，本地先挡一下，
+	// 免得用户连点把号码打成风控。
+	codeCooldown = 60 * time.Second
 )
 
-var errLoginSession = errors.New("登录链接已失效，请回面板重新点「添加账号」")
+var errLoginSession = errors.New("登录会话已过期，请重新获取验证码")
 
-// loginSession 是一次设备授权流程（一个账号一个全新设备号）。
+// 登录方式与地区的绑定关系（面板与文档共用同一句话，避免两边说得不一样）。
+const (
+	// 手机号登录只服务国内站（见 loginStart 的检查）。
+	errSMSOnlyCN = "手机号登录只用于国内版（web.tabbit.com）：请把地区切成「国内版」；国际版请用「凭证导入」（复制整串 cookie）"
+)
+
+// loginSession 是一次短信登录。
 type loginSession struct {
-	Machine string
-	Realm   string
-	Login   *upstream.DeviceLogin
-	At      time.Time
-	// Busy 上一次 poll 还没回来：前端 3s 一次比上游慢时会重叠，重叠会并发打同一个 nonce。
-	Busy bool
+	Realm    string
+	Mobile   string
+	UUID     string
+	At       time.Time
+	Verified bool
 }
 
+// randHex 生成 n 字节的随机 hex 串（登录会话 id 等）。
 func randHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -40,84 +55,110 @@ func randHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// loginStart 生成设备授权链接：{id, url}。用户在自己浏览器里打开 url 完成授权。
+// loginStart 第一步：发验证码。入参 {realm, mobile}，返回 {id, resend_in}。
+//
+// 上游要的 uuid（64 位随机串）留在服务端：前端拿不到也不需要知道，
+// 少一个可被误用的字段。
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Realm string `json:"realm"`
+		Realm  string `json:"realm"`
+		Mobile string `json:"mobile"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req)
-	realm := auth.RealmGlobal
-	if strings.EqualFold(strings.TrimSpace(req.Realm), auth.RealmCN) {
-		realm = auth.RealmCN
-	}
-	login, err := upstream.NewDeviceLogin(p.cfg.Upstream, realm, "")
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+	_ = json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req)
+	realm := normalizeLoginRealm(req.Realm)
+	// 登录方式和地区是一一对应的，不是偏好：上游对国际站的手机号登录返回
+	// 403 auth.noBetaPermission，国内站又只支持手机号。所以这里直接挡住越界组合，
+	// 免得用户拿到一句上游的灰度错误提示去猜。
+	if realm != auth.RealmCN {
+		writeErr(w, http.StatusBadRequest, errSMSOnlyCN)
 		return
 	}
+	mobile := strings.TrimSpace(req.Mobile)
+	if mobile == "" {
+		writeErr(w, http.StatusBadRequest, "请填写手机号")
+		return
+	}
+	uuid := upstream.NewLoginUUID()
+	// 45s：走代理的首个请求常在 20s 上下（线路冷启动），30s 会偶发误报超时。
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	if err := p.cfg.Upstream.SendLoginCode(ctx, realm, mobile, uuid); err != nil {
+		writeErr(w, loginErrStatus(err), publicErr(err))
+		return
+	}
+
+	id, _ := randHex(8)
 	p.loginMu.Lock()
 	if p.logins == nil {
 		p.logins = map[string]loginSession{}
 	}
-	// 顺手清掉过期会话，避免面板长开时 map 无限增长。
-	for id, sess := range p.logins {
+	for oldID, sess := range p.logins { // 清过期会话，避免面板长开时 map 一直涨
 		if time.Since(sess.At) > loginTTL {
-			delete(p.logins, id)
+			delete(p.logins, oldID)
 		}
 	}
-	p.logins[login.State()] = loginSession{Realm: realm, Login: login, At: time.Now()}
+	p.logins[id] = loginSession{Realm: realm, Mobile: mobile, UUID: uuid, At: time.Now()}
 	p.loginMu.Unlock()
+
+	log.Printf("panel: 已发送登录验证码 realm=%s mobile=%s", realm, maskMobile(mobile))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":    login.State(),
-		"url":   login.AuthURL(),
-		"realm": realm,
+		"id": id, "realm": realm, "resend_in": int(codeCooldown.Seconds()),
 	})
 }
 
-// loginPoll 查一次授权结果：未完成 → {done:false}（前端每 3s 再问）；
-// 会话不存在/过期 → 410（前端停止轮询）；完成 → 落盘入池并回 {done:true}。
-//
-// 做成「一次一查」而不是服务端长等：设备流没有回调，verifier 又只能在服务端，
-// 所以必须有人轮询——让浏览器按固定节拍问，用户什么时候授权完都在下一次问到时收号，
-// 不需要再点一次「我已授权」。
+// loginPoll 查一次会话状态：前端用它判断「会话还在不在 / 是否已完成」。
+// 401/410 = 会话没了（过期或被清理），前端应回到填手机号那一步。
 func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	p.loginMu.Lock()
 	sess, ok := p.logins[id]
-	if ok && sess.Busy {
-		// 上一次查询还没回来（上游慢）：本轮直接说「没完成」，避免并发打同一个 nonce。
-		p.loginMu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"done": false})
-		return
-	}
-	if ok {
-		sess.Busy = true
-		p.logins[id] = sess
-	}
 	p.loginMu.Unlock()
 	if !ok || time.Since(sess.At) > loginTTL {
+		p.dropLogin(id)
 		writeErr(w, http.StatusGone, errLoginSession.Error())
 		return
 	}
-	// 失败路径复位闸门，供下一次轮询继续（成功路径已 delete 掉会话）。
-	defer func() {
-		p.loginMu.Lock()
-		if s, still := p.logins[id]; still {
-			s.Busy = false
-			p.logins[id] = s
-		}
-		p.loginMu.Unlock()
-	}()
+	writeJSON(w, http.StatusOK, map[string]any{"done": sess.Verified, "realm": sess.Realm})
+}
 
-	creds, done, err := sess.Login.Poll(r.Context())
-	if err != nil {
-		// 5xx/超时交给前端继续重试：授权可能已在浏览器侧完成，停掉就永远不入池。
-		writeErr(w, http.StatusBadGateway, err.Error())
+// loginVerify 第二步：用验证码换登录态，落盘入池。入参 {id, code}。
+func (p *Panel) loginVerify(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID   string `json:"id"`
+		Code string `json:"code"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req)
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		writeErr(w, http.StatusBadRequest, "请填写验证码")
 		return
 	}
-	if !done {
-		writeJSON(w, http.StatusOK, map[string]any{"done": false})
+	p.loginMu.Lock()
+	sess, ok := p.logins[req.ID]
+	p.loginMu.Unlock()
+	if !ok || time.Since(sess.At) > loginTTL {
+		p.dropLogin(req.ID)
+		writeErr(w, http.StatusGone, errLoginSession.Error())
 		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	result, err := p.cfg.Upstream.SmsLogin(ctx, sess.Realm, sess.Mobile, code, sess.UUID)
+	if err != nil {
+		writeErr(w, loginErrStatus(err), publicErr(err))
+		return
+	}
+	// 拿到的 cookie 交给同一条导入管线（校验登录态 → 补昵称 → 落盘 → 入池）。
+	// realm 用本次登录的站点：短信换来的登录态只在该站有效。
+	creds, err := p.cfg.Upstream.PrepareAccount(ctx,
+		map[string]any{"cookie": result.Cookie, "realm": result.Realm}, result.Realm)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "登录成功但校验失败："+publicErr(err))
+		return
+	}
+	if creds.Snapshot().Nickname == "" && result.Nickname != "" {
+		creds.SetNickname(result.Nickname)
 	}
 	uid, nick, err := p.saveAccount(creds)
 	if err != nil {
@@ -125,9 +166,62 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.loginMu.Lock()
+	if s, still := p.logins[req.ID]; still {
+		s.Verified = true
+		p.logins[req.ID] = s
+	}
+	p.loginMu.Unlock()
+	log.Printf("panel: 短信登录成功 uid=%s realm=%s mobile=%s", uid, result.Realm, maskMobile(sess.Mobile))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"done": true, "ok": true, "uid": uid, "nickname": nick, "realm": result.Realm,
+	})
+}
+
+// dropLogin 删掉一个会话。
+func (p *Panel) dropLogin(id string) {
+	p.loginMu.Lock()
 	delete(p.logins, id)
 	p.loginMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": true, "uid": uid, "nickname": nick})
+}
+
+// loginErrStatus 把登录错误映射成 HTTP 状态码。
+//
+// 验证码错/号码格式错是「用户能自己改」的 400；太频繁是 429；网络与上游 5xx 是 502。
+func loginErrStatus(err error) int {
+	var codeErr *upstream.LoginCodeError
+	if errors.As(err, &codeErr) {
+		msg := codeErr.Msg
+		if strings.Contains(msg, "频繁") || strings.Contains(msg, "过多") {
+			return http.StatusTooManyRequests
+		}
+		return http.StatusBadRequest
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "deadline exceeded") {
+		return http.StatusGatewayTimeout // 上游/代理太慢，不是用户填错了
+	}
+	var upErr *upstream.Error
+	if errors.As(err, &upErr) {
+		if upErr.Status >= 500 || upErr.Status == 0 {
+			return http.StatusBadGateway
+		}
+	}
+	return http.StatusBadRequest
+}
+
+// normalizeLoginRealm 把面板传来的地区归一：只认 cn / intl，其余按国际。
+func normalizeLoginRealm(realm string) string {
+	if strings.EqualFold(strings.TrimSpace(realm), auth.RealmCN) {
+		return auth.RealmCN
+	}
+	return auth.RealmIntl
+}
+
+// maskMobile 只留前 3 后 2，日志里别写完整号码。
+func maskMobile(mobile string) string {
+	if len(mobile) <= 5 {
+		return "***"
+	}
+	return mobile[:3] + "****" + mobile[len(mobile)-2:]
 }
 
 // saveAccount 把一个已确认的凭证落盘并入池（同一 uid 直接覆盖旧文件）。
@@ -144,7 +238,8 @@ func (p *Panel) saveAccount(creds *auth.Auth) (uid, nickname string, err error) 
 	return creds.UID, creds.Nickname, nil
 }
 
-// loginRefresh 用一条 cookie token 直登（Tabbit 没有 refresh token，这就是唯一凭据）。
+// loginRefresh 用手上已有的 token 直登（Tabbit 没有 refresh token，token 就是唯一凭据）。
+// 面板的「手动粘贴」走这里：一次性把 token 换成本地账号记录。
 func (p *Panel) loginRefresh(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token string `json:"token"`
@@ -159,7 +254,7 @@ func (p *Panel) loginRefresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请填写 token（浏览器 cookie 里的 token 值）")
 		return
 	}
-	creds := &auth.Auth{Data: auth.Data{Token: rt, Realm: auth.RealmIntl}}
+	creds := &auth.Auth{Data: auth.Data{Token: rt, Realm: normalizeLoginRealm(req.Realm)}}
 	if err := p.completeByRefresh(r.Context(), creds); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -180,7 +275,7 @@ func (p *Panel) loginRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "nickname": nick})
 }
 
-// completeByRefresh 续期一次并补齐 uid/昵称（refresh 响应可能不带 user_id，再查 userinfo）。
+// completeByRefresh 探活一次并补齐 uid/昵称（Tabbit 没有续期，这里只做校验）。
 func (p *Panel) completeByRefresh(ctx context.Context, creds *auth.Auth) error {
 	if err := p.cfg.Upstream.RefreshToken(creds); err != nil {
 		return err
@@ -199,7 +294,7 @@ func (p *Panel) completeByRefresh(ctx context.Context, creds *auth.Auth) error {
 		creds.UID = uid
 	}
 	if nick != "" {
-		creds.Nickname = nick
+		creds.SetNickname(nick)
 	}
 	return nil
 }

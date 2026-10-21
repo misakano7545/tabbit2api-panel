@@ -125,6 +125,24 @@ func (a *Auth) SetQuota(percent float64) {
 	a.mu.Unlock()
 }
 
+// SetNickname 写入展示名（上游 base-info 的 display_name 或 JWT 的 name）。
+//
+// 只在拿到**非空且不等于 uid** 的值时写入：上游没设昵称时不要用 uid 覆盖掉
+// 用户手工起的名字（面板允许自行命名）。
+func (a *Auth) SetNickname(nickname string) bool {
+	nickname = strings.TrimSpace(nickname)
+	if nickname == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if nickname == a.UID || nickname == a.Nickname {
+		return false
+	}
+	a.Nickname = nickname
+	return true
+}
+
 // FileNameFor 给出账号文件的规范名。
 func FileNameFor(uid string) string {
 	uid = strings.TrimSpace(uid)
@@ -251,10 +269,25 @@ func Parse(raw []byte) (*Auth, error) {
 	if a.UID == "" {
 		return nil, errors.New("无法从 token 解析用户标识，请粘贴含 user_id 的账号记录或 cookie 串")
 	}
+	a.nicknameFallback()
+	return a, nil
+}
+
+// nicknameFallback 在没拿到昵称时按「JWT name → uid」补一个。
+//
+// Tabbit 的 JWT payload 里有 `name`（上游生成的 user_xxxx），它比 uid 更像人名；
+// 老版本把昵称直接写成 uid 落了盘，这里把「昵称 == uid」也当成没设置，等于顺手迁移。
+func (a *Auth) nicknameFallback() {
+	if a.Nickname != "" && a.Nickname != a.UID {
+		return
+	}
+	if name := JWTName(a.Token); name != "" && name != a.UID {
+		a.Nickname = name
+		return
+	}
 	if a.Nickname == "" {
 		a.Nickname = a.UID
 	}
-	return a, nil
 }
 
 // parseFreeform 接受裸 JWT 或 `token=…; user_id=…` cookie 串。
@@ -321,9 +354,7 @@ func (a *Auth) CompleteIdentity(_ string) error {
 	if a.UID == "" {
 		return errors.New("无法从 token 解析用户标识，请粘贴含 user_id 的完整账号记录")
 	}
-	if a.Nickname == "" {
-		a.Nickname = a.UID
-	}
+	a.nicknameFallback()
 	return nil
 }
 
@@ -395,6 +426,26 @@ func JWTUserID(token string) string {
 		var num json.Number
 		if json.Unmarshal(raw, &num) == nil && num.String() != "" && num.String() != "0" {
 			return num.String()
+		}
+	}
+	return ""
+}
+
+// JWTName 读 JWT payload 里上游给的默认展示名（Tabbit 字段名是 `name`，
+// 形如 user_4b24e854fd25）；解不出返回空串。不验签。
+func JWTName(token string) string {
+	claims := jwtClaims(token)
+	if claims == nil {
+		return ""
+	}
+	for _, key := range []string{"name", "nickname", "display_name"} {
+		raw, ok := claims[key]
+		if !ok {
+			continue
+		}
+		var text string
+		if json.Unmarshal(raw, &text) == nil && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
 		}
 	}
 	return ""

@@ -57,17 +57,29 @@ type Status struct {
 	// Realm 账号地区（cn / intl）：国际版账号没有签到接口、只能做国际版模型。
 	Realm   string `json:"realm,omitempty"`
 	Credits int64  `json:"credits"`
-	// CreditsTotal 上游给的积分总额（各包 credits_limit 之和），只作分母：
-	// 「积分」列显示 剩余/总额。0 表示还没查到过，界面只显示剩余。
-	CreditsTotal int64     `json:"credits_total,omitempty"`
-	Expire       int64     `json:"expire,omitempty"` // 最早到期时间（Unix 秒），0 表示无到期信息
-	Cooling      bool      `json:"cooling"`
-	Until        time.Time `json:"until,omitempty"`
-	Reason       string    `json:"reason,omitempty"`
-	Disabled     bool      `json:"disabled"`
-	ErrCount     int       `json:"err_count,omitempty"`     // 熔断连败计数
-	Degraded     int       `json:"degrade_count,omitempty"` // 降权连败计数
-	InFlight     int       `json:"in_flight,omitempty"`     // 当前在途请求数
+	// CreditsTotal 在 Tabbit 上恒为 100（百分比制的分母）。
+	// 历史上它是「积分包面额之和」；Tabbit 没有积分，这里只作 100% 的分母存在。
+	CreditsTotal int64 `json:"credits_total,omitempty"`
+	// UsedPercent 上游 usage_percentage 原值（0-100）：百分比制下剩余=100-已用，
+	// 面板按它画进度条，不涉及积分/金额换算。
+	UsedPercent float64 `json:"used_percent,omitempty"`
+	// MemberLevel 上游会员档位（free / standard / pro）。
+	MemberLevel string `json:"member_level,omitempty"`
+	// ResetAt 下次额度重置时刻（Unix 秒）；0 = 上游没给。
+	// Tabbit 的周期是 7 天（current_cycle_start/end），到了重置点已用量归零。
+	ResetAt      int64 `json:"reset_at,omitempty"`
+	ResetCoupons int64 `json:"reset_coupons,omitempty"`
+	// CycleStart / CycleEnd 是上游给的周期字符串（2026.10.21 / 2026.10.28），只为展示。
+	CycleStart string    `json:"cycle_start,omitempty"`
+	CycleEnd   string    `json:"cycle_end,omitempty"`
+	Expire     int64     `json:"expire,omitempty"` // 最早到期时间（Unix 秒），0 表示无到期信息
+	Cooling    bool      `json:"cooling"`
+	Until      time.Time `json:"until,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	Disabled   bool      `json:"disabled"`
+	ErrCount   int       `json:"err_count,omitempty"`     // 熔断连败计数
+	Degraded   int       `json:"degrade_count,omitempty"` // 降权连败计数
+	InFlight   int       `json:"in_flight,omitempty"`     // 当前在途请求数
 
 	// 额度口径：上游两份计费体系字段不同名也不可换算（见 upstream.entUsagePack）。
 	//   CreditUnit="credit"（国内，默认）：看 Credits/CreditsTotal
@@ -95,6 +107,14 @@ type entry struct {
 	unit     string
 	usedUSD  float64
 	limitUSD float64
+	// 百分比制额度（Tabbit）：usedPercent 是上游 usage_percentage 原值，
+	// memberLevel/resetAt/resetCoupons 只用于面板展示。
+	usedPercent  float64
+	memberLevel  string
+	resetAt      int64
+	resetCoupons int64
+	cycleStart   string
+	cycleEnd     string
 	// 签到域冷却，与网关冷却（until/reason）分开：前者只挡签到轮次。
 	coolUntil  time.Time
 	coolReason string
@@ -187,6 +207,13 @@ type stateAccount struct {
 	Unit     string  `json:"credit_unit,omitempty"`
 	UsedUSD  float64 `json:"used_usd,omitempty"`
 	LimitUSD float64 `json:"limit_usd,omitempty"`
+	// 百分比制额度快照：重启后不必等第一次刷新就能显示「已用 x%」。
+	UsedPercent  float64 `json:"used_percent,omitempty"`
+	MemberLevel  string  `json:"member_level,omitempty"`
+	ResetAt      int64   `json:"reset_at,omitempty"`
+	ResetCoupons int64   `json:"reset_coupons,omitempty"`
+	CycleStart   string  `json:"cycle_start,omitempty"`
+	CycleEnd     string  `json:"cycle_end,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -605,10 +632,18 @@ func (p *Pool) SetCreditsExpire(uid string, credits, total, expire int64) {
 // 为什么不合成一个数：国内是积分、国际是美元，上游两套字段不同名（credits_limit vs
 // basic_usage_limit）且**不可换算**。硬折算会造出一个两边都不准的数字。
 type Balance struct {
-	Unit   string // "credit"（默认）| "usd"
-	Remain int64  // 积分口径
-	Total  int64
-	// 美元口径（Unit="usd"）。Free plan 实测 used=0.00059，必须留小数。
+	Unit   string // "%"（Tabbit 百分比制，默认）| "usd"（历史遗留）
+	Remain int64  // 剩余百分比（Unit="%" 时）
+	Total  int64  // 恒 100
+	// UsedPercent 上游 usage_percentage 原值（0-100），面板进度条用它。
+	UsedPercent  float64
+	MemberLevel  string
+	ResetAt      int64
+	ResetCoupons int64
+	// CycleStart / CycleEnd 是上游原始周期字符串（2026.10.21 / 2026.10.28），只为展示。
+	CycleStart string
+	CycleEnd   string
+	// 美元口径（Unit="usd"）；Tabbit 不用，保留字段为零值。
 	UsedUSD  float64
 	LimitUSD float64
 }
@@ -625,12 +660,14 @@ func (p *Pool) SetBalance(uid string, b Balance, expire int64) {
 	}
 	unit := b.Unit
 	if unit == "" {
-		unit = "credit"
+		unit = "%" // Tabbit 只有百分比制
 	}
 	e.unit, e.usedUSD, e.limitUSD = unit, b.UsedUSD, b.LimitUSD
+	e.usedPercent, e.memberLevel = b.UsedPercent, b.MemberLevel
+	e.resetAt, e.resetCoupons = b.ResetAt, b.ResetCoupons
+	e.cycleStart, e.cycleEnd = b.CycleStart, b.CycleEnd
 	if unit == "usd" {
-		// 美元号：credits 留 0（没有积分这回事），余额看 usedUSD/limitUSD。
-		// 不把美元塞进 credits —— 那会让「积分」列显示一个不是积分的数。
+		// 历史口径：美元号 credits 留 0，余额看 usedUSD/limitUSD。
 		e.credits, e.creditsTotal = 0, 0
 	} else {
 		e.credits, e.creditsTotal = b.Remain, b.Total
@@ -958,6 +995,25 @@ func (p *Pool) List() []Status {
 	return out
 }
 
+// Accounts 返回池里所有账号对象（只读用途：拿 realm 去刷目录等，不做选择/计数）。
+// 顺序按 uid 排序，保证调用方行为稳定。
+func (p *Pool) Accounts() []*auth.Auth {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	uids := make([]string, 0, len(p.byUID))
+	for uid := range p.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	out := make([]*auth.Auth, 0, len(uids))
+	for _, uid := range uids {
+		if e := p.byUID[uid]; e != nil && e.a != nil {
+			out = append(out, e.a)
+		}
+	}
+	return out
+}
+
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	return Status{
@@ -966,6 +1022,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:        e.a.Realm(),
 		Credits:      e.credits,
 		CreditsTotal: e.creditsTotal,
+		UsedPercent:  e.usedPercent,
+		MemberLevel:  e.memberLevel,
+		ResetAt:      e.resetAt,
+		ResetCoupons: e.resetCoupons,
+		CycleStart:   e.cycleStart,
+		CycleEnd:     e.cycleEnd,
 		Expire:       e.expire,
 		CreditUnit:   e.unit,
 		UsedUSD:      e.usedUSD,
@@ -1023,6 +1085,12 @@ func (p *Pool) load() {
 			unit:             s.Unit,
 			usedUSD:          s.UsedUSD,
 			limitUSD:         s.LimitUSD,
+			usedPercent:      s.UsedPercent,
+			memberLevel:      s.MemberLevel,
+			resetAt:          s.ResetAt,
+			resetCoupons:     s.ResetCoupons,
+			cycleStart:       s.CycleStart,
+			cycleEnd:         s.CycleEnd,
 		}
 	}
 }
@@ -1049,6 +1117,12 @@ func (p *Pool) saveLocked() {
 			Unit:         e.unit,
 			UsedUSD:      e.usedUSD,
 			LimitUSD:     e.limitUSD,
+			UsedPercent:  e.usedPercent,
+			MemberLevel:  e.memberLevel,
+			ResetAt:      e.resetAt,
+			ResetCoupons: e.resetCoupons,
+			CycleStart:   e.cycleStart,
+			CycleEnd:     e.cycleEnd,
 		}
 	}
 	raw, err := json.MarshalIndent(sf, "", "  ")

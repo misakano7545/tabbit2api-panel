@@ -44,9 +44,8 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule struct {
-		// CheckinHours / CheckinEnabled 是基线的签到段：Tabbit 上游没有签到接口，
-		// 这两个键**不生效**（调度器恒按「上游未开」跳过）。保留键只为旧配置文件不报错。
-		CheckinHours []int `json:"checkin_hours"` // [9]，Tabbit 不实现
+		// CheckinHours / CheckinEnabled：每日签到（上游 /api/commerce/activity/v1/sign-in）。
+		CheckinHours []int `json:"checkin_hours"` // [9]：每日签到时点（0-23）
 		// KeepaliveHours token 保活时点（每日无条件全账号探活一遍，0-23）。
 		KeepaliveHours []int `json:"keepalive_hours"` // [3]
 		// 开关缺省 true：键缺席保留默认，空数组仍回落默认时点——「禁用」只走开关，语义不混。

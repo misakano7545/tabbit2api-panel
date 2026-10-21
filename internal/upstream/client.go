@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -49,18 +51,28 @@ const (
 	PointsBase = BaseIntl
 	Origin     = BaseIntl
 
-	SignKeyPath  = "/chat/sign-key"
-	CatalogPath  = "/proxy/v1/model_config/models"
-	SessionPath  = "/panel/session"
-	ChatPath     = "/api/v1/chat/completion"
+	SignKeyPath = "/chat/sign-key"
+	CatalogPath = "/proxy/v1/model_config/models"
+	SessionPath = "/panel/session"
+	// 对话走 v3 房间协议：先 join 订阅 SSE，再向 runs 投递消息（2026-10 实测，
+	// 旧的 POST /api/v1/chat/completion 已不在 Web UI 里再用）。
+	JoinPath     = "/api/v3/chat/rooms/%s/join"
+	RunsPath     = "/api/v3/chat/rooms/%s/runs"
+	ChatPath     = RunsPath // 兼容旧引用
 	UserInfoPath = "/api/v0/user/base-info"
 	QuotaPath    = "/api/commerce/quota/v1/usage"
 
-	// FallbackSignKey 是前端硬编码的初始 key：/chat/sign-key 拿不到时先用它。
+	SignInStatusPath = "/api/commerce/activity/v1/sign-in/status"
+	SignInPath       = "/api/commerce/activity/v1/sign-in"
+
+	// FallbackSignKey 是前端硬编码的初始 key（国际版）：/chat/sign-key 拿不到时先用它。
 	FallbackSignKey = "f8d0e6a73f8d4b1a9c3d2e1f9a4b7c6d"
-	// DefaultReqCtx 是 base64("1.6.20(10106020)")：上游按 {version}({build}) 解析，
-	// 格式不对会判 493「版本过低」。
-	DefaultReqCtx = "MS42LjIwKDEwMTA2MDIwKQ=="
+	// FallbackSignKeyCN 是国内版的初始 key：两站的 key 不同，抓包实测确认
+	// （web.tabbit.com/chat/sign-key → 3a9b1c8d…，用它签 intl 请求会被判签名错）。
+	FallbackSignKeyCN = "3a9b1c8d5e7f4b209c2d1f4a6e7b8c9f"
+	// DefaultReqCtx 是 base64("1.17.16(10117016)")：上游按 {version}({build}) 解析，
+	// 格式不对会判 493「版本过低」。版本号跟随桌面端 1.17.16。
+	DefaultReqCtx = "MS4xNy4xNigxMDExNzAxNik="
 	// ClientID 是上游前端固定的 Chrome 集成 client_id。
 	ClientID = "2dd8eb4c1ed9c344d173"
 
@@ -237,8 +249,14 @@ type sessionEntry struct {
 }
 
 // New 生产默认值：连接池共享，短请求 120s 兜底、长流只看首字节超时。
+//
+// Proxy 必须显式给 ProxyFromEnvironment：自建 Transport 不带 Proxy 字段就等于
+// 强制直连，HTTPS_PROXY 会被静默忽略——而 web.tabbit.ai 直连会拿到 CDN 的
+// 403「Service Unavailable」（HTML，不是 JSON），面板上的表现就是「登录态失效」，
+// 极难排查。抓包/翻墙场景都靠它。
 func New() *Client {
 	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
@@ -479,6 +497,10 @@ func (c *Client) do(req *http.Request) (int, []byte, error) {
 	if err != nil {
 		return resp.StatusCode, raw, &Error{Kind: ErrServer, Status: 502, Msg: "读取 Tabbit 响应失败"}
 	}
+	if os.Getenv("TABBIT_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[upstream] %s %s -> %d %s\n", req.Method, req.URL,
+			resp.StatusCode, truncate(string(raw), 200))
+	}
 	return resp.StatusCode, raw, nil
 }
 
@@ -496,14 +518,22 @@ func (c *Client) signKey(a *auth.Auth) (string, error) {
 		if entry != nil {
 			return entry.key, nil // 刷新失败沿用旧 key：可能还能用，别让一次网络抖动打断对话
 		}
-		return FallbackSignKey, err
+		return fallbackSignKey(a.Realm()), err
 	}
 	c.signMu.Lock()
 	defer c.signMu.Unlock()
 	if latest := c.signs[base]; latest != nil {
 		return latest.key, nil
 	}
-	return FallbackSignKey, nil
+	return fallbackSignKey(a.Realm()), nil
+}
+
+// fallbackSignKey 返回该站点的硬编码初始 key（两站不同，不能混用）。
+func fallbackSignKey(realm string) string {
+	if realm == auth.RealmCN {
+		return FallbackSignKeyCN
+	}
+	return FallbackSignKey
 }
 
 // refreshSignKey 拉一次 GET /chat/sign-key。
@@ -552,7 +582,12 @@ func (c *Client) signedRequest(method, url, rawBody, refererPath string, a *auth
 	}
 	req.Header.Set("trace-id", randomUUID())
 	// cookie 头手工拼：Tabbit 只认这几个固定项，用 cookie jar 反而要管域名。
+	// Authorization: Bearer 一并带上——国内站的 commerce（签到）只认 Bearer，
+	// 国际站两种都收；同一份 JWT，带上不会改变判定。
 	req.Header.Set("Cookie", cookieHeader(cookies(a)))
+	if jwt := a.JWT(); jwt != "" {
+		req.Header.Set("Authorization", "Bearer "+jwt)
+	}
 	key, _ := c.signKey(a)
 	for name, value := range signatureHeaders(key, rawBody, c.now()) {
 		req.Header.Set(name, value)
@@ -632,23 +667,46 @@ func (c *Client) SessionCount() int {
 // ---------------------------------------------------------------------------
 // 对话
 
-// buildChatPayload 组装上游 completion 请求体；content 是已摊平的 prompt，
+// buildRunPayload 组装 v3 runs 请求体；content 是已摊平的 prompt，
 // model 是目录里的 display_name（发 slug 会被服务端静默切模型）。
-func buildChatPayload(sessionID, content, model string) (string, error) {
+//
+// 上游形状（实测）：selected_model 是数组，正文在 input_payload.content，
+// 历史靠 parent_message_id 串，references/metadatas 是「当前网页」上下文（网关留空）。
+func buildRunPayload(content, model string) (string, error) {
+	runID := "tab_" + randomUUID()
 	payload := map[string]any{
-		"chat_session_id":   sessionID,
-		"message_id":        nil,
-		"content":           content,
-		"selected_model":    model,
-		"parallel_group_id": nil,
-		"task_name":         "chat",
-		"agent_mode":        false,
-		"metadatas":         map[string]any{"html_content": "<p>" + content + "</p>"},
-		"references":        []any{},
-		"entity":            map[string]any{"key": md5Empty(), "extras": map[string]any{"type": "tab", "url": ""}},
-		"client_turn_id":    randomUUID(),
-		"stream_mode":       "sse",
-		"force_execute":     false,
+		"client_run_id":           runID,
+		"client_message_id":       runID,
+		"agent_plan_mode_enabled": false,
+		"input_payload": map[string]any{
+			"task_name":         "chat",
+			"content":           content,
+			"parent_message_id": nil,
+			"selected_model":    []any{model},
+			"references":        []any{},
+			"metadatas":         map[string]any{"html_content": "<p>" + content + "</p>"},
+			"page_info_list":    []any{},
+			"is_mobile":         false,
+			"agent_mode":        false,
+			"entity": map[string]any{"key": md5Empty(),
+				"extras": map[string]any{"type": "tab", "url": ""}},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// buildJoinPayload 是 join 的 body：只声明订阅者身份，不携带对话内容。
+func buildJoinPayload(seed string) (string, error) {
+	digest := sha256.Sum256([]byte("tabbit-page:" + seed))
+	payload := map[string]any{
+		"page_instance_id": randomUUID(),
+		"device_id_hash":   hex.EncodeToString(digest[:]),
+		"surface":          "panel",
+		"last_event_id":    nil,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -684,18 +742,58 @@ func (c *Client) chatStream(ctx context.Context, a *auth.Auth, body []byte) (io.
 	if err != nil {
 		return nil, 502, nil, err
 	}
-	bodyRaw, err := buildChatPayload(sessionID, prompt, model)
-	if err != nil {
-		return nil, 500, nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造 Tabbit 请求体失败"}
-	}
-	return c.postChat(ctx, a, sessionID, bodyRaw, req)
+	return c.runChat(ctx, a, sessionID, prompt, model, req)
 }
 
-// postChat 发一次 completion 请求，499（签名 key 轮换）刷新后重试一次。
-func (c *Client) postChat(ctx context.Context, a *auth.Auth, sessionID, bodyRaw string, spec chatRequestSpec) (io.ReadCloser, int, []byte, error) {
+// runChat 走 v3 房间协议：先 join 订阅该房间的 SSE，再向 runs 投递消息，
+// 然后把 join 的事件流交给转换层（按 run_id 过滤，别的并发 run 的帧一律丢弃）。
+//
+// 顺序不能反：join 晚于 runs 时会漏掉 run_queued/首批 chunk（实测 join 只在
+// 订阅之后的帧上推送，历史要 merge message_history 快照，代价更大）。
+func (c *Client) runChat(ctx context.Context, a *auth.Auth, room, prompt, model string, spec chatRequestSpec) (io.ReadCloser, int, []byte, error) {
+	joinBody, err := buildJoinPayload(a.Snapshot().UID + "|" + room)
+	if err != nil {
+		return nil, 500, nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造 Tabbit 订阅请求失败"}
+	}
+	subscribe, status, raw, err := c.openJoin(ctx, a, room, joinBody)
+	if err != nil {
+		return nil, status, raw, err
+	}
+
+	runRaw, err := buildRunPayload(prompt, model)
+	if err != nil {
+		_ = subscribe.Body.Close()
+		return nil, 500, nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造 Tabbit 请求体失败"}
+	}
+	runID, status, raw, err := c.postRun(ctx, a, room, runRaw)
+	if err != nil {
+		_ = subscribe.Body.Close()
+		return nil, status, raw, err
+	}
+
+	conv := newConvertReader(subscribe.Body, spec)
+	conv.runID = runID
+	// 先窥一帧：上游可能用 200 + run_failed/error 事件表达权益不足或排队拒绝，
+	// 只看状态码会把它记成成功、账号也就没法换。
+	first, err := conv.peek()
+	if err != nil {
+		_ = subscribe.Body.Close()
+		return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "读取 Tabbit 首帧失败"}
+	}
+	if first != nil {
+		_ = subscribe.Body.Close()
+		return nil, first.Status, []byte(first.Msg), &Error{Kind: first.Kind, Status: first.Status,
+			Msg: first.Msg, Busy: first.Kind == ErrBusy}
+	}
+	return conv, 200, nil, nil
+}
+
+// openJoin 订阅房间事件流（唯一带签名的对话请求）。
+func (c *Client) openJoin(ctx context.Context, a *auth.Auth, room, bodyRaw string) (*http.Response, int, []byte, error) {
 	base := c.BaseFor(a.Realm())
+	target := base + fmt.Sprintf(JoinPath, url.PathEscape(room))
 	for attempt := 0; attempt < 2; attempt++ {
-		headers := c.baseHeaders(a, "/session/"+sessionID)
+		headers := c.baseHeaders(a, "/panel/"+room)
 		headers["Accept"] = "text/event-stream"
 		headers["Content-Type"] = "application/json"
 		headers["Cache-Control"] = "no-cache"
@@ -709,14 +807,13 @@ func (c *Client) postChat(ctx context.Context, a *auth.Auth, sessionID, bodyRaw 
 			headers[name] = value
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+ChatPath, strings.NewReader(bodyRaw))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(bodyRaw))
 		if err != nil {
 			return nil, 500, nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造 Tabbit 上游请求失败"}
 		}
 		for name, value := range headers {
 			httpReq.Header.Set(name, value)
 		}
-
 		resp, err := c.streamClient().Do(httpReq)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -738,28 +835,57 @@ func (c *Client) postChat(ctx context.Context, a *auth.Auth, sessionID, bodyRaw 
 			kind := Classify(resp.StatusCode, string(raw))
 			msg := truncate(errorText(raw), 300)
 			if msg == "" {
-				msg = fmt.Sprintf("Tabbit 返回 HTTP %d", resp.StatusCode)
+				msg = fmt.Sprintf("Tabbit 订阅房间失败（HTTP %d）", resp.StatusCode)
 			}
 			return nil, resp.StatusCode, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: msg,
 				Busy: kind == ErrBusy, ServiceUnavailable: queueUnavailable(string(raw))}
 		}
-
-		conv := newConvertReader(resp.Body, spec)
-		// 先窥一帧：上游常在 200 里用 error 事件表达 492（权益）与 409（会话忙），
-		// 只看状态码会把它当成功、账号也就没法换。
-		first, err := conv.peek()
-		if err != nil {
-			_ = resp.Body.Close()
-			return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "读取 Tabbit 首帧失败"}
-		}
-		if first != nil {
-			_ = resp.Body.Close()
-			return nil, first.Status, []byte(first.Msg), &Error{Kind: first.Kind, Status: first.Status,
-				Msg: first.Msg, Busy: first.Kind == ErrBusy}
-		}
-		return conv, resp.StatusCode, nil, nil
+		return resp, resp.StatusCode, nil, nil
 	}
 	return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "Tabbit 签名 key 刷新后仍返回 499"}
+}
+
+// postRun 投递一次对话（实测不带签名头），返回 run_id 供事件过滤。
+func (c *Client) postRun(ctx context.Context, a *auth.Auth, room, bodyRaw string) (string, int, []byte, error) {
+	base := c.BaseFor(a.Realm())
+	target := base + fmt.Sprintf(RunsPath, url.PathEscape(room))
+	headers := c.baseHeaders(a, "/panel/"+room)
+	headers["Accept"] = "application/json"
+	headers["Content-Type"] = "application/json"
+	reqCtx, defaultBrowser := c.requestContext()
+	headers["x-req-ctx"] = reqCtx
+	headers["unique-uuid"] = uniqueUUID(defaultBrowser, c.now())
+	headers["trace-id"] = randomUUID()
+	headers["Cookie"] = cookieHeader(cookies(a))
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(bodyRaw))
+	if err != nil {
+		return "", 500, nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造 Tabbit 上游请求失败"}
+	}
+	for name, value := range headers {
+		httpReq.Header.Set(name, value)
+	}
+	status, raw, err := c.do(httpReq)
+	if err != nil {
+		return "", status, raw, err
+	}
+	if status < 200 || status >= 300 {
+		if status == http.StatusConflict {
+			c.dropSession(a) // 房间被占用：下次换新房间
+		}
+		kind := Classify(status, string(raw))
+		msg := truncate(errorText(raw), 300)
+		if msg == "" {
+			msg = fmt.Sprintf("Tabbit 投递消息失败（HTTP %d）", status)
+		}
+		return "", status, raw, &Error{Kind: kind, Status: status, Msg: msg,
+			Busy: kind == ErrBusy, ServiceUnavailable: queueUnavailable(string(raw))}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", 502, raw, &Error{Kind: ErrServer, Status: 502, Msg: "Tabbit 未返回有效 run 信息"}
+	}
+	return text(payload, "run_id"), status, raw, nil
 }
 
 // PrepareBody 是入站体的轻量规整钩子：Tabbit 的上游请求由本包自己组装，入站体原样保留。
@@ -803,7 +929,21 @@ func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, 
 	info, _ := payload["user_info"].(map[string]any)
 	snap := a.Snapshot()
 	uid = orDefault(text(info, "user_id", "uid", "id"), snap.UID)
-	nickname = orDefault(text(info, "nickname", "name", "user_name"), snap.Nickname)
+	// 昵称口径（实测）：上游字段叫 display_name；用户没设过时它是空串，
+	// 此时 JWT 的 name 里还有一个上游生成的默认名（user_xxxx）。
+	// 旧代码只认 nickname/name/user_name，于是永远拿不到 → 面板显示 uid。
+	nickname = text(info, "display_name", "nickname", "name", "user_name")
+	if nickname == "" {
+		nickname = auth.JWTName(a.JWT())
+	}
+	// 拿到真名就写回账号（调用方随后 SaveAtomic 时一并落盘）；没有就保留原值，
+	// 不用 uid 顶替用户可能手工设过的名字。
+	if nickname != "" && nickname != snap.UID {
+		a.SetNickname(nickname)
+	}
+	if nickname == "" {
+		nickname = snap.Nickname
+	}
 	return uid, nickname, text(info, "enterprise_id"), nil
 }
 

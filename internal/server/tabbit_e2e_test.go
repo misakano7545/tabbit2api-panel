@@ -23,9 +23,18 @@ type fakeTabbit struct {
 	failCode int // 非 0 时首帧回 error 事件（模拟 492 权益不足）
 	lastBody map[string]any
 	lastReq  *http.Request
+	// joined 记录 join 是否先于 runs 发生（协议顺序断言）。
+	joined  chan struct{}
+	runSent chan struct{}
 }
 
 func (f *fakeTabbit) handler() http.Handler {
+	if f.joined == nil {
+		f.joined = make(chan struct{}, 1)
+	}
+	if f.runSent == nil {
+		f.runSent = make(chan struct{}, 1)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat/sign-key", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "test-sign-key")
@@ -33,33 +42,47 @@ func (f *fakeTabbit) handler() http.Handler {
 	mux.HandleFunc("/panel/session", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"chat_session_id":"sess-1"}`)
 	})
-	mux.HandleFunc("/api/v1/chat/completion", func(w http.ResponseWriter, r *http.Request) {
-		f.lastReq = r
-		body, _ := io.ReadAll(r.Body)
-		f.lastBody = map[string]any{}
-		_ = json.Unmarshal(body, &f.lastBody)
-		w.Header().Set("Content-Type", "text/event-stream")
-		flush := func() {
-			if fl, ok := w.(http.Flusher); ok {
-				fl.Flush()
+	// v3 join：先发订阅快照，再从 runs 到达后推送事件（真上游也是这个顺序）。
+	mux.HandleFunc("/api/v3/chat/rooms/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/join"):
+			if got := r.Header.Get("x-nonce"); got == "" {
+				http.Error(w, `{"message":"missing signature"}`, http.StatusUnauthorized)
+				return
 			}
-		}
-		frame := func(event, data string) {
-			_, _ = io.WriteString(w, "event: "+event+"\ndata: "+data+"\n\n")
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			flush := func() {
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
+			}
+			select {
+			case f.joined <- struct{}{}:
+			default:
+			}
 			flush()
-		}
-		frame("ready", `{}`)
-		if f.failCode != 0 {
-			frame("error", `{"code":492,"message":"欢迎使用 Tabbit 浏览器"}`)
+			select {
+			case <-f.runSent:
+			case <-time.After(3 * time.Second):
+				http.Error(w, "no run", http.StatusGatewayTimeout)
+				return
+			}
+			f.streamRun(w, flush)
+			return
+		case strings.HasSuffix(r.URL.Path, "/runs"):
+			f.lastReq = r
+			body, _ := io.ReadAll(r.Body)
+			f.lastBody = map[string]any{}
+			_ = json.Unmarshal(body, &f.lastBody)
+			select {
+			case f.runSent <- struct{}{}:
+			default:
+			}
+			_, _ = io.WriteString(w, `{"run_id":"run-1","room_id":"sess-1","status":"QUEUED"}`)
 			return
 		}
-		if f.thinking != "" {
-			frame("thinking", `{"reasoning_content":`+quote(f.thinking)+`}`)
-		}
-		for _, piece := range f.reply {
-			frame("message_chunk", `{"content":`+quote(piece)+`}`)
-		}
-		frame("message_finish", `{}`)
+		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/proxy/v1/model_config/models", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"models":[
@@ -73,8 +96,70 @@ func (f *fakeTabbit) handler() http.Handler {
 	mux.HandleFunc("/api/commerce/quota/v1/usage", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"usage_percentage":12.5,"member_level":"free"}`)
 	})
+	mux.HandleFunc("/api/commerce/activity/v1/sign-in/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"results":[{"scene_code":"daily_sign_in","activity_open":true,"signed_today":false}]}`)
+	})
+	mux.HandleFunc("/api/commerce/activity/v1/sign-in", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"results":[{"scene_code":"daily_sign_in","sign_in_result":"success","usage_reward_result":"skipped"}]}`)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	return mux
+}
+
+// streamRun 按真上游的 v3 事件序列推一次对话。
+//
+// 真上游每帧是一行紧凑 JSON：data: 行必须单行，否则截断成多条 data 行后
+// 下游只能拼回半截 JSON（这里用 marshal 而不是手写多行字符串）。
+func (f *fakeTabbit) streamRun(w http.ResponseWriter, flush func()) {
+	emit := func(event string, payload map[string]any) {
+		env := map[string]any{
+			"event_id":   "e-" + event,
+			"room_id":    "sess-1",
+			"event_type": event,
+			"payload":    payload,
+			"created_at": "2026-10-21T00:00:00Z",
+		}
+		raw, _ := json.Marshal(env)
+		_, _ = io.WriteString(w, "id: 1\nevent: "+event+"\ndata: "+string(raw)+"\n\n")
+		flush()
+	}
+	base := func(extra map[string]any) map[string]any {
+		out := map[string]any{"run_id": "run-1"}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+	emit("snapshot_begin", map[string]any{})
+	emit("active_runs_snapshot", map[string]any{"runs": []any{}})
+	emit("snapshot_end", map[string]any{})
+	emit("run_queued", base(map[string]any{"status": "QUEUED"}))
+	emit("run_started", base(map[string]any{"status": "RUNNING"}))
+	emit("assistant_message_started", base(map[string]any{"message_id": "m-1"}))
+	if f.failCode != 0 {
+		emit("run_failed", base(map[string]any{"status": "FAILED", "message": "欢迎使用 Tabbit 浏览器"}))
+		return
+	}
+	if f.thinking != "" {
+		emit("event_message_chunk", base(map[string]any{
+			"chunk_type":    "thinking",
+			"chunk_payload": map[string]any{"reasoning_content": f.thinking, "message_id": "m-1"},
+		}))
+		emit("event_message_chunk", base(map[string]any{
+			"chunk_type": "thinking_finished", "chunk_payload": map[string]any{"message_id": "m-1"},
+		}))
+	}
+	for _, piece := range f.reply {
+		emit("assistant_message_delta", base(map[string]any{
+			"chunk_type":    "message_chunk",
+			"delta":         piece,
+			"chunk_payload": map[string]any{"content": piece, "message_id": "m-1"},
+			"message_id":    "m-1",
+		}))
+	}
+	emit("assistant_message_finished", base(map[string]any{"message_id": "m-1"}))
+	emit("run_completed", base(map[string]any{"status": "COMPLETED"}))
+	emit("room_reset_required", base(map[string]any{"status": "COMPLETED"}))
 }
 
 func quote(s string) string {
@@ -150,12 +235,14 @@ func TestChatNonStream(t *testing.T) {
 	if out.Choices[0].FinishReason != "stop" {
 		t.Errorf("finish_reason = %q", out.Choices[0].FinishReason)
 	}
-	// 上游只认 display_name，发 slug 会被静默换模型。
-	if got := fake.lastBody["selected_model"]; got != "GPT-5.5" {
-		t.Errorf("selected_model = %v，应为目录里的 display_name", got)
+	// 上游只认 display_name，发 slug 会被静默换模型（v3：selected_model 是数组）。
+	input, _ := fake.lastBody["input_payload"].(map[string]any)
+	models, _ := input["selected_model"].([]any)
+	if len(models) != 1 || models[0] != "GPT-5.5" {
+		t.Errorf("selected_model = %v，应为 [\"GPT-5.5\"]", input["selected_model"])
 	}
-	if got := fake.lastBody["chat_session_id"]; got != "sess-1" {
-		t.Errorf("chat_session_id = %v", got)
+	if prompt, _ := input["content"].(string); prompt == "" {
+		t.Errorf("input_payload.content 为空")
 	}
 }
 
@@ -224,7 +311,8 @@ func TestToolCallRepair(t *testing.T) {
 		t.Errorf("finish_reason = %q", out.Choices[0].FinishReason)
 	}
 	// 协议说明必须进了上游 prompt，否则模型不知道该怎么调。
-	if prompt, _ := fake.lastBody["content"].(string); !strings.Contains(prompt, "<tool_call>") {
+	input, _ := fake.lastBody["input_payload"].(map[string]any)
+	if prompt, _ := input["content"].(string); !strings.Contains(prompt, "<tool_call>") {
 		t.Errorf("prompt 里没有工具协议: %q", prompt)
 	}
 }

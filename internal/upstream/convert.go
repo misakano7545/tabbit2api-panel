@@ -4,14 +4,17 @@
 // server 层的三协议适配）全部只认「OpenAI chunk 帧」。让本文件实现一个
 // io.ReadCloser 做翻译，那 600 多行管道一行不用改，三套入口自然跟着通。
 //
-// 上游事件（实测存在，其余一律忽略）：
+// 上游是 v3 房间协议（POST /api/v3/chat/rooms/{id}/join 的事件流），
+// 每帧形如 `event: <type>` + `data: {"event_type":…,"payload":{…},"created_at":…}`：
 //
-//	ready / ttft / title / switch_model / message_start  控制帧，无正文
-//	thinking           data.reasoning_content  思考增量
-//	message_chunk      data.content            正文增量
-//	usage              data.input_tokens/output_tokens（实测很少出现）
-//	error              data.code/data.message  流内错误（492 权益 / 409 会话忙）
-//	message_finish / finish / close             结束
+//	snapshot_begin / snapshot_end / active_runs_snapshot / message_history  订阅快照，忽略
+//	run_queued / run_started / user_message_created                          控制帧
+//	assistant_message_started                                                控制帧
+//	event_message_chunk  payload.chunk_type=thinking → chunk_payload.reasoning_content
+//	assistant_message_delta  payload.delta（或 chunk_payload.content）       正文增量
+//	assistant_message_finished / run_completed                               结束
+//	run_failed / error                                                       流内错误
+//	room_reset_required / session_title_updated                              忽略
 //
 // 正文里的工具调用标记由 toolScanner 增量剥离，转成 delta.tool_calls。
 package upstream
@@ -44,6 +47,8 @@ type convertReader struct {
 	err      *Error       // peek 阶段发现的上游错误（尚未交给调用方）
 	// pendingUsage 是 usage 事件先于结束帧到达时的暂存。
 	pendingUsage map[string]any
+	// runID 是本次投递的 run：join 流里别的并发 run 的帧一律丢弃。
+	runID string
 }
 
 func newConvertReader(src io.ReadCloser, spec chatRequestSpec) *convertReader {
@@ -151,7 +156,67 @@ func (c *convertReader) translate(event, raw string) error {
 	}
 	// 少数站点把事件名放在 data.type 里。
 	if event == "" {
-		event = text(payload, "type", "event")
+		event = text(payload, "type", "event", "event_type")
+	}
+	// v3 房间事件：正文/思考/错误都在 payload 里，且要按 run_id 过滤。
+	if inner, ok := payload["payload"].(map[string]any); ok {
+		if run := text(inner, "run_id"); run != "" && c.runID != "" && run != c.runID {
+			return nil // 同一房间里的其他 run，不串话
+		}
+		switch event {
+		case "event_message_chunk":
+			kind := text(inner, "chunk_type")
+			chunk, _ := inner["chunk_payload"].(map[string]any)
+			switch kind {
+			case "thinking":
+				if delta := text(chunk, "reasoning_content", "content"); delta != "" {
+					c.ensureRole()
+					c.writeChunk(map[string]any{"reasoning_content": delta}, nil)
+				}
+			case "thinking_finished":
+				// 无正文
+			case "error":
+				msg := text(chunk, "message", "error_message", "detail")
+				c.err = streamErrorOf(0, msg, raw)
+				c.finish("")
+				return nil
+			default:
+				// message_chunk 变体：正文也可能塞在这里
+				if delta := text(chunk, "content"); delta != "" {
+					c.pushContent(delta)
+				}
+			}
+			return nil
+		case "assistant_message_delta":
+			delta := text(inner, "delta")
+			if delta == "" {
+				if chunk, ok := inner["chunk_payload"].(map[string]any); ok {
+					delta = text(chunk, "content")
+				}
+			}
+			if delta != "" {
+				c.pushContent(delta)
+			}
+			return nil
+		case "assistant_message_finished":
+			c.finish("")
+			return nil
+		case "run_completed":
+			c.finish("")
+			return nil
+		case "run_failed", "run_cancelled":
+			msg := text(inner, "message", "error_message", "reason", "detail")
+			if msg == "" {
+				msg = text(inner, "status")
+			}
+			c.err = streamErrorOf(0, msg, raw)
+			c.finish("")
+			return nil
+		case "snapshot_begin", "snapshot_end", "message_history", "active_runs_snapshot",
+			"run_queued", "run_started", "user_message_created", "assistant_message_started",
+			"session_title_updated", "room_reset_required", "usage":
+			return nil
+		}
 	}
 	switch event {
 	case "thinking":
@@ -249,6 +314,21 @@ func streamErrorOf(code int, msg, raw string) *Error {
 		}
 	}
 	return &Error{Kind: kind, Status: status, Msg: msg, Busy: kind == ErrBusy}
+}
+
+// pushContent 处理一段正文增量：先过工具标记扫描，再写 chunk。
+func (c *convertReader) pushContent(content string) {
+	if content == "" {
+		return
+	}
+	c.ensureRole()
+	plain, calls := c.scan.Push(content)
+	if plain != "" {
+		c.writeChunk(map[string]any{"content": plain}, nil)
+	}
+	for _, call := range calls {
+		c.writeToolCall(call)
+	}
 }
 
 // ensureRole 在首个正文帧前发一次角色帧（OpenAI 客户端靠它判定流已开始）。

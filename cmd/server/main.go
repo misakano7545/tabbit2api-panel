@@ -178,8 +178,9 @@ func main() {
 		Upstream:       up,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		// Tabbit 没有签到接口：签到轮恒关（配置里的 checkin_* 不生效，见 config.go）。
-		CheckinEnabled:         false,
+		// 签到现在是真实接口（/api/commerce/activity/v1/sign-in），按配置生效：
+		// activity_open=false 时上游会回 enable=false，这一轮如实跳过。
+		CheckinEnabled:         cfg.Schedule.CheckinEnabled,
 		KeepaliveEnabled:       cfg.Schedule.KeepaliveEnabled,
 		BalanceRefreshInterval: cfg.BalanceRefreshInt,
 	})

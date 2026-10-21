@@ -79,6 +79,8 @@ type Event struct {
 	TotalTokens      int64     `json:"total_tokens,omitempty"`
 	Credit           float64   `json:"credit,omitempty"`
 	HasCredit        bool      `json:"credit_known"`
+	// TokensEstimated 表示 token 数是本地估算（上游不报 token），面板加 ~ 前缀。
+	TokensEstimated bool `json:"tokens_estimated,omitempty"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92 同步）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`

@@ -21,6 +21,8 @@ type fakeTabbit struct {
 	reply    []string
 	thinking string
 	failCode int // 非 0 时首帧回 error 事件（模拟 492 权益不足）
+	// usage 非 nil 时随 run_completed 的 payload 带 token_usage（模拟真上游的用量帧）。
+	usage    map[string]any
 	lastBody map[string]any
 	lastReq  *http.Request
 	// joined 记录 join 是否先于 runs 发生（协议顺序断言）。
@@ -157,8 +159,12 @@ func (f *fakeTabbit) streamRun(w http.ResponseWriter, flush func()) {
 			"message_id":    "m-1",
 		}))
 	}
+	completed := base(map[string]any{"status": "COMPLETED"})
+	if f.usage != nil {
+		completed["token_usage"] = f.usage
+	}
 	emit("assistant_message_finished", base(map[string]any{"message_id": "m-1"}))
-	emit("run_completed", base(map[string]any{"status": "COMPLETED"}))
+	emit("run_completed", completed)
 	emit("room_reset_required", base(map[string]any{"status": "COMPLETED"}))
 }
 
@@ -394,5 +400,87 @@ func TestModelAliases(t *testing.T) {
 	rec := post(t, h, "/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != http.StatusOK {
 		t.Errorf("缺 model → %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 请求记录要能看到每次请求的 token 用量：上游把 token_usage 放在 run_completed 的
+// payload 里，此前被当成忽略帧丢掉，面板请求表整列都是「—」。这里断言三条通路：
+// 非流式 usage 字段、流式末帧 usage 字段、以及 reqlog 事件里的 token 数。
+func TestUsageReachesRequestLog(t *testing.T) {
+	usage := map[string]any{"input_tokens": 120, "output_tokens": 45}
+
+	// 非流式：响应体要带 usage（OpenAI 形状）。
+	h, fake := newFakeHandler(t)
+	fake.usage = usage
+	rec := post(t, h, "/v1/chat/completions",
+		`{"model":"gpt-5-5","messages":[{"role":"user","content":"在吗"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解响应失败: %v (%s)", err, rec.Body.String())
+	}
+	if out.Usage.PromptTokens != 120 || out.Usage.CompletionTokens != 45 || out.Usage.TotalTokens != 165 {
+		t.Errorf("非流式 usage = %+v", out.Usage)
+	}
+
+	// 流式：末帧（finish_reason 帧）要带 usage。
+	h2, fake2 := newFakeHandler(t)
+	fake2.usage = usage
+	rec = post(t, h2, "/v1/chat/completions",
+		`{"model":"gpt-5-5","stream":true,"messages":[{"role":"user","content":"在吗"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream status=%d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"prompt_tokens":120`) {
+		t.Errorf("流式末帧缺 usage: %s", rec.Body.String())
+	}
+
+	// 请求记录（reqlog）：两条请求的事件里都要有 token 数。
+	check := func(h *Handler, want int64) {
+		t.Helper()
+		ev := h.cfg.RequestLog.Snapshot().Recent
+		if len(ev) == 0 {
+			t.Fatal("请求记录为空")
+		}
+		e := ev[len(ev)-1]
+		if e.TotalTokens != want {
+			t.Errorf("请求记录 total_tokens = %d，应为 %d（prompt=%d completion=%d）",
+				e.TotalTokens, want, e.PromptTokens, e.CompletionTokens)
+		}
+	}
+	check(h, 165)
+	check(h2, 165)
+}
+
+// 上游不报 token（实测就是这样）：请求记录仍要有量级，但必须标成估算——
+// 面板加 ~ 前缀，用量台账不许进估算值。
+func TestRequestLogEstimatesTokensWhenUpstreamSilent(t *testing.T) {
+	h, _ := newFakeHandler(t) // fake.usage 为 nil：上游一帧 token 都不报
+	rec := post(t, h, "/v1/chat/completions",
+		`{"model":"gpt-5-5","messages":[{"role":"user","content":"在吗"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	ev := h.cfg.RequestLog.Snapshot().Recent
+	if len(ev) == 0 {
+		t.Fatal("请求记录为空")
+	}
+	e := ev[len(ev)-1]
+	if !e.TokensEstimated {
+		t.Errorf("上游没报 token，记录却没标估算: %+v", e)
+	}
+	if e.TotalTokens <= 0 || e.CompletionTokens <= 0 {
+		t.Errorf("估算没落进请求记录: total=%d completion=%d", e.TotalTokens, e.CompletionTokens)
+	}
+	if e.HasCredit {
+		t.Errorf("估算的 token 不该算积分: credit=%v", e.Credit)
 	}
 }

@@ -1075,7 +1075,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
               <th>来源 IP</th><th>User-Agent</th>
-              <th class="num">耗时</th><th class="num">Token</th><th class="num">额度</th><th>请求 ID</th>
+              <th class="num">耗时</th><th class="num" title="上游 Tabbit 不报 token 数，带 ~ 的值是按字符估算的（提示词 + 产出正文），只作量级参考">Token</th><th class="num">额度</th><th>请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>
           </table>

@@ -764,7 +764,9 @@ function reqOutcomeTag(e) {
 function reqTokenCell(e) {
   const total = Number(e && e.total_tokens || 0) ||
     (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
-  return total ? fmtTok(total) : '—';
+  if (!total) return '—';
+  // 上游 Tabbit 不报 token，估算值加 ~ 区分（tooltip 里说明，别让人当成账单数）。
+  return e.tokens_estimated ? '~' + fmtTok(total) : fmtTok(total);
 }
 
 function reqCreditCell(e) {
@@ -825,7 +827,7 @@ function requestLogText(e) {
     e && e.client_ip || '—',
     e && e.user_agent || '—',
     fmtMs(e && e.duration_ms),
-    fmtTok(token) + ' tok',
+    (e && e.tokens_estimated ? '~' : '') + fmtTok(token) + (e && e.tokens_estimated ? ' tok（估算）' : ' tok'),
     credit,
     cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
     e && e.request_id || '—',

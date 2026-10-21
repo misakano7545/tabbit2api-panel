@@ -27,6 +27,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/misakano7545/tabbit2api-panel/internal/usage"
 )
 
 // convertReader 是交给 server 层的「上游 OpenAI 流」。
@@ -47,6 +49,10 @@ type convertReader struct {
 	err      *Error       // peek 阶段发现的上游错误（尚未交给调用方）
 	// pendingUsage 是 usage 事件先于结束帧到达时的暂存。
 	pendingUsage map[string]any
+	// promptTokens 是本请求送上游的 prompt 估算（runChat 填）。上游一帧 token 都不报，
+	// 收尾时靠它与 gen 的字数补一个带 estimated 标记的 usage。
+	promptTokens int64
+	gen          strings.Builder // 已产出的正文/思考，用于估算 completion
 	// runID 是本次投递的 run：join 流里别的并发 run 的帧一律丢弃。
 	runID string
 }
@@ -158,8 +164,12 @@ func (c *convertReader) translate(event, raw string) error {
 	if event == "" {
 		event = text(payload, "type", "event", "event_type")
 	}
+	// 用量帧可能在任何事件里（v3 的 usage/run_completed 都带 payload 外壳）：
+	// 先吸出 token 数再分派，否则它会掉进下面的忽略表，请求记录里就全是「—」。
+	inner, hasInner := payload["payload"].(map[string]any)
+	c.absorbUsage(payload, inner, chunkPayloadOf(inner))
 	// v3 房间事件：正文/思考/错误都在 payload 里，且要按 run_id 过滤。
-	if inner, ok := payload["payload"].(map[string]any); ok {
+	if hasInner {
 		if run := text(inner, "run_id"); run != "" && c.runID != "" && run != c.runID {
 			return nil // 同一房间里的其他 run，不串话
 		}
@@ -170,6 +180,7 @@ func (c *convertReader) translate(event, raw string) error {
 			switch kind {
 			case "thinking":
 				if delta := text(chunk, "reasoning_content", "content"); delta != "" {
+					c.gen.WriteString(delta)
 					c.ensureRole()
 					c.writeChunk(map[string]any{"reasoning_content": delta}, nil)
 				}
@@ -199,7 +210,9 @@ func (c *convertReader) translate(event, raw string) error {
 			}
 			return nil
 		case "assistant_message_finished":
-			c.finish("")
+			// 不在这里收尾：v3 的 token_usage 随后面的 run_completed 才到，先 finish 会把
+			// 结束帧写早、usage 落空（请求记录整列「—」）。收尾交给 run_completed /
+			// run_failed / error / 流 EOF（finish 幂等，缺结束事件也有 EOF 兜底）。
 			return nil
 		case "run_completed":
 			c.finish("")
@@ -214,13 +227,14 @@ func (c *convertReader) translate(event, raw string) error {
 			return nil
 		case "snapshot_begin", "snapshot_end", "message_history", "active_runs_snapshot",
 			"run_queued", "run_started", "user_message_created", "assistant_message_started",
-			"session_title_updated", "room_reset_required", "usage":
+			"session_title_updated", "room_reset_required":
 			return nil
 		}
 	}
 	switch event {
 	case "thinking":
 		if delta := text(payload, "reasoning_content", "content", "text"); delta != "" {
+			c.gen.WriteString(delta)
 			c.ensureRole()
 			c.writeChunk(map[string]any{"reasoning_content": delta}, nil)
 		}
@@ -243,28 +257,8 @@ func (c *convertReader) translate(event, raw string) error {
 			}
 		}
 	case "usage":
-		// 上游 usage 与 OpenAI 字段名不同，转一下再交给累积器。
-		usage := map[string]any{}
-		if n, ok := asInt64(payload["input_tokens"]); ok {
-			usage["prompt_tokens"] = n
-		}
-		if n, ok := asInt64(payload["output_tokens"]); ok {
-			usage["completion_tokens"] = n
-		}
-		if n, ok := asInt64(payload["prompt_tokens"]); ok {
-			usage["prompt_tokens"] = n
-		}
-		if n, ok := asInt64(payload["completion_tokens"]); ok {
-			usage["completion_tokens"] = n
-		}
-		if len(usage) > 0 {
-			if _, ok := usage["total_tokens"]; !ok {
-				prompt, _ := asInt64(usage["prompt_tokens"])
-				completion, _ := asInt64(usage["completion_tokens"])
-				usage["total_tokens"] = prompt + completion
-			}
-			c.pendingUsage = usage
-		}
+		// 上游 usage 与 OpenAI 字段名不同，由 absorbUsage 统一翻译（见该函数）。
+		c.absorbUsage(payload)
 	case "error":
 		msg := text(payload, "message", "msg", "error_message", "displayTips")
 		if msg == "" {
@@ -289,6 +283,61 @@ func (c *convertReader) translate(event, raw string) error {
 }
 
 // pendingUsage 是 usage 事件先于结束帧到达时的暂存。
+
+// absorbUsage 从一帧的几个可能载体里吸出用量。上游把 token 数放在哪一层不稳定
+// （顶层的 usage 帧、v3 信封里的 payload、chunk_payload，甚至跟着 run_completed 一起来），
+// 所以按载体顺序找一遍，找到就以最后一次为准。
+func (c *convertReader) absorbUsage(maps ...map[string]any) {
+	for _, m := range maps {
+		if u := usageOf(m); u != nil {
+			c.pendingUsage = u
+		}
+	}
+}
+
+// usageOf 把上游的 token 字段翻成 OpenAI 键名：新接口用 input/output_tokens，
+// 旧接口用 prompt/completion_tokens；两者也可能整体嵌在 token_usage 子对象里
+// （v3 实测：run_completed.payload.token_usage）。一个都没报就是「没观测到」，
+// 返回 nil 不编 0。
+func usageOf(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	if nested, ok := m["token_usage"].(map[string]any); ok {
+		if u := usageOf(nested); u != nil {
+			return u
+		}
+	}
+	usage := map[string]any{}
+	if n, ok := asInt64(m["input_tokens"]); ok {
+		usage["prompt_tokens"] = n
+	}
+	if n, ok := asInt64(m["prompt_tokens"]); ok {
+		usage["prompt_tokens"] = n
+	}
+	if n, ok := asInt64(m["output_tokens"]); ok {
+		usage["completion_tokens"] = n
+	}
+	if n, ok := asInt64(m["completion_tokens"]); ok {
+		usage["completion_tokens"] = n
+	}
+	if len(usage) == 0 {
+		return nil
+	}
+	prompt, _ := asInt64(usage["prompt_tokens"])
+	completion, _ := asInt64(usage["completion_tokens"])
+	usage["total_tokens"] = prompt + completion
+	return usage
+}
+
+// chunkPayloadOf 取 v3 事件里的 chunk_payload（正文增量与用量都可能塞在这一层）。
+func chunkPayloadOf(inner map[string]any) map[string]any {
+	if inner == nil {
+		return nil
+	}
+	chunk, _ := inner["chunk_payload"].(map[string]any)
+	return chunk
+}
 
 // streamErrorOf 把上游 error 事件分类成 *Error。
 func streamErrorOf(code int, msg, raw string) *Error {
@@ -321,6 +370,7 @@ func (c *convertReader) pushContent(content string) {
 	if content == "" {
 		return
 	}
+	c.gen.WriteString(content)
 	c.ensureRole()
 	plain, calls := c.scan.Push(content)
 	if plain != "" {
@@ -389,6 +439,7 @@ func (c *convertReader) finish(reason string) {
 	if plain, calls := c.scan.Flush(); plain != "" || len(calls) > 0 {
 		c.ensureRole()
 		if plain != "" {
+			// 不再计入 c.gen：这段正文早已随 pushContent 计入，重复加会虚高 completion。
 			c.writeChunk(map[string]any{"content": plain}, nil)
 		}
 		for _, call := range calls {
@@ -400,6 +451,16 @@ func (c *convertReader) finish(reason string) {
 	}
 	if c.toolIdx > 0 {
 		reason = "tool_calls"
+	}
+	// 上游报多少用多少；一个数都没报才估算，并打 estimated 标记（见 usage.EstimateTokens）。
+	if c.pendingUsage == nil {
+		ct := int64(usage.EstimateTokens([]rune(c.gen.String())))
+		c.pendingUsage = map[string]any{
+			"prompt_tokens":     c.promptTokens,
+			"completion_tokens": ct,
+			"total_tokens":      c.promptTokens + ct,
+			"estimated":         true,
+		}
 	}
 	c.writeChunk(map[string]any{}, &reason)
 	c.out.WriteString("data: [DONE]\n\n")

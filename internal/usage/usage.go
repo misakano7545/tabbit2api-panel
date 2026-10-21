@@ -151,6 +151,9 @@ type Delta struct {
 	// 命中率 = 命中 / prompt；HasCacheHit=false 表示这次上游没报，不能当成 0% 命中。
 	CacheHitTokens int64
 	HasCacheHit    bool
+	// Estimated：token 数是本地估算（上游不报）。请求记录照收并标 ~，积分不按估算算——
+	// 拿估算乘单价等于凭空造一个账单数字。
+	Estimated bool
 }
 
 // Add 记录一次请求尝试。

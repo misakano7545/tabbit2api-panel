@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/misakano7545/tabbit2api-panel/internal/auth"
+	"github.com/misakano7545/tabbit2api-panel/internal/usage"
 )
 
 // 上游地址：两个站点各一套目录/账号，账号归哪个站由 auth 决定。
@@ -773,6 +774,8 @@ func (c *Client) runChat(ctx context.Context, a *auth.Auth, room, prompt, model 
 
 	conv := newConvertReader(subscribe.Body, spec)
 	conv.runID = runID
+	// 上游不报 token（实抓确认）：只填 prompt 估算，收尾时与正文一起合成 usage。
+	conv.promptTokens = int64(usage.EstimateTokens([]rune(prompt)))
 	// 先窥一帧：上游可能用 200 + run_failed/error 事件表达权益不足或排队拒绝，
 	// 只看状态码会把它记成成功、账号也就没法换。
 	first, err := conv.peek()

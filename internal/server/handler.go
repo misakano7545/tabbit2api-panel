@@ -720,13 +720,26 @@ func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstr
 	if ch, has := numField(upstreamUsage, "cache_read_input_tokens"); has {
 		d.CacheHitTokens, d.HasCacheHit = ch, true
 	}
+	// 上游一个 token 都不报时，转换层会给一份带 estimated:true 的估算（见 convert.finish）。
+	// 请求记录照收（面板显示 ~量级），但台账只记账上游真报的数——估算一旦进账就再也分不清虚实。
+	estimated, _ := upstreamUsage["estimated"].(bool)
 	// 请求记录（面板「运行日志」页的请求表）与用量台账吃同一个 Delta：token/积分/缓存命中
 	// 在这里一次性带上，避免两处各算一遍再对不上。失败尝试同样带 token（上游有时在错误
 	// 响应里也回了 usage），积分则由单价估算——和台账的「积分≈」是同一套口径。
 	//
 	// 先喂请求记录、再写台账：台账 recorder 为 nil（未接用量）时请求记录仍要有 token，
 	// 否则这两件事被隐式绑在一起——「没用量台账」会顺带让运行日志的请求行也变成 tok=-。
+	if tr != nil {
+		tr.TokensEstimated = estimated || tr.TokensEstimated
+	}
+	d.Estimated = estimated
 	tr.addUsage(model, d)
+	if estimated {
+		d.PromptTokens, d.HasPromptTokens = 0, false
+		d.CompletionTokens, d.HasCompletion = 0, false
+		d.TotalTokens, d.HasTotal = 0, false
+		d.CacheHitTokens, d.HasCacheHit = 0, false
+	}
 	if h.cfg.Usage == nil {
 		return
 	}

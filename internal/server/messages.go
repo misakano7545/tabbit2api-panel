@@ -14,6 +14,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/misakano7545/tabbit2api-panel/internal/usage"
 )
 
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -81,20 +83,11 @@ func (h *Handler) countTokens(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": countChars(obj)})
 }
 
-// countTokensEstimate 按字符类型折算 token：实测中文 0.62 token/字、英文约 4 字符/token
-// （2026-10 长上下文针测试：400k 汉字 = 249,847 token）。纯 chars/4 对中文低估 2.5 倍。
-// 不含上游自己注入的系统提示（客户端看不到，随请求固定，不影响力度的判断）。
+// tokenEstimate 按字符类型折算 token（实现与请求记录的估算是同一份，见
+// usage.EstimateTokens）。不含上游自己注入的系统提示（客户端看不到，随请求固定，
+// 不影响力度的判断）。
 func tokenEstimate(runes []rune) int {
-	n := 0.0
-	for _, r := range runes {
-		switch {
-		case r > 0x2E80: // CJK / 假名 / 谚文
-			n += 0.62
-		default:
-			n += 0.25
-		}
-	}
-	return int(n + 0.999)
+	return usage.EstimateTokens(runes)
 }
 
 // countChars 累加请求里的正文字符：跳过结构字段（模型名/类型/角色/id），只算真正占用

@@ -41,6 +41,8 @@ type reqTrace struct {
 	CacheHitTokens   int64
 	Credit           float64
 	HasCredit        bool
+	// TokensEstimated 表示上面的 token 数是本地估算（上游不报 token），面板据此加 ~ 前缀。
+	TokensEstimated bool
 }
 
 // addUsage 把一次出站尝试的用量吸收进本请求的追踪游标。
@@ -69,7 +71,8 @@ func (t *reqTrace) addUsage(model string, d usage.Delta) {
 	}
 	// 零 token 不标「已计价」：EstimateCredit 对 0/0/0 会正常返回 0，标了就等于在面板上
 	// 声称「这次扣了 0 积分」，而实际是这次没有可计价的产出（失败尝试大多如此）。
-	if d.PromptTokens+d.CompletionTokens > 0 {
+	// 估算的 token 也不计价：估算乘单价就是编一个账单数字。
+	if d.PromptTokens+d.CompletionTokens > 0 && !d.Estimated {
 		if v, ok := usage.EstimateCredit(model, d.PromptTokens, d.CompletionTokens, d.CacheHitTokens); ok {
 			t.Credit += v
 			t.HasCredit = true
@@ -78,9 +81,10 @@ func (t *reqTrace) addUsage(model string, d usage.Delta) {
 }
 
 // cacheMissTokens 缓存未命中量 = prompt − 命中（上游只报命中量，未命中量由此推导；
-// 两者都缺失时不猜，保持 0 = 面板不显示命中率）。
+// 两者都缺失时不猜，保持 0 = 面板不显示命中率）。prompt 本身是估算时也保持 0：
+// 拿估算去减「从没报过的命中」等于凭空造一个 100% 未命中。
 func (t *reqTrace) cacheMissTokens() int64 {
-	if t.PromptTokens <= 0 {
+	if t.PromptTokens <= 0 || t.TokensEstimated {
 		return 0
 	}
 	miss := t.PromptTokens - t.CacheHitTokens
@@ -178,6 +182,9 @@ func logChatRow(tr *reqTrace, status int, outcome string, dur time.Duration, wit
 	tok, credit := "-", "-"
 	if n := tr.PromptTokens + tr.CompletionTokens; n > 0 {
 		tok = strconv.FormatInt(n, 10)
+		if tr.TokensEstimated {
+			tok = "~" + tok // 上游不报 token，这是按字符估的
+		}
 	}
 	if tr.HasCredit {
 		credit = strconv.FormatFloat(tr.Credit, 'f', 4, 64)
@@ -243,6 +250,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      tr.TotalTokens,
 		Credit:           tr.Credit,
 		HasCredit:        tr.HasCredit,
+		TokensEstimated:  tr.TokensEstimated,
 		CacheHitTokens:   tr.CacheHitTokens,
 		CacheMissTokens:  tr.cacheMissTokens(),
 		ClientIP:         tr.ClientIP,

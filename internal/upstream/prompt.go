@@ -129,8 +129,16 @@ func (s chatRequestSpec) toolsOf() map[string]bool {
 // buildPrompt 摊平消息并追加工具协议，返回送上游的 content。
 func buildPrompt(spec chatRequestSpec) (string, error) {
 	var systems, others []string
+	// 客户端回的 tool 消息只带 tool_call_id、不带工具名（OpenAI 规范如此），
+	// 但模型要靠名字对上是哪次调用的结果，所以从前面 assistant 的调用里反查。
+	callNames := map[string]string{}
 	for _, message := range spec.Messages {
-		text := renderMessage(message)
+		for _, call := range message.ToolCalls {
+			if call.ID != "" && call.Function.Name != "" {
+				callNames[call.ID] = call.Function.Name
+			}
+		}
+		text := renderMessage(message, callNames)
 		if text == "" {
 			continue
 		}
@@ -143,7 +151,7 @@ func buildPrompt(spec chatRequestSpec) (string, error) {
 	}
 
 	out := joinWithinBudget(systems, others)
-	if protocol := toolProtocol(spec.Tools); protocol != "" {
+	if protocol := toolProtocol(spec); protocol != "" {
 		if out != "" {
 			out += "\n\n"
 		}
@@ -156,7 +164,7 @@ func buildPrompt(spec chatRequestSpec) (string, error) {
 }
 
 // renderMessage 把一条消息渲染成带角色标记的文本块。
-func renderMessage(message chatMessage) string {
+func renderMessage(message chatMessage, callNames map[string]string) string {
 	text := messageText(message.Content)
 	switch message.Role {
 	case "system", "developer":
@@ -166,8 +174,12 @@ func renderMessage(message chatMessage) string {
 		return "[系统指令]\n" + text
 	case "tool", "function":
 		label := "工具结果"
-		if message.Name != "" {
-			label += " " + message.Name
+		name := message.Name
+		if name == "" {
+			name = callNames[message.ToolCallID]
+		}
+		if name != "" {
+			label += " " + name
 		}
 		return "[" + label + "]\n" + text
 	case "assistant":

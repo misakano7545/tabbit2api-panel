@@ -367,6 +367,34 @@ const (
 // ---------------------------------------------------------------------------
 // 非流式
 
+// returnResult 是 Aggregate 的收尾口：一个字都没吐（既无正文也无工具调用）按空流处理。
+// 上游偶尔会回一个只有思考、没有正文也没有调用消息的回合，直接透出就是给 Agent
+// 客户端一个 content 为空的 200 —— 循环当场停住，且没有任何错误可重试。
+func (a *accumulator) returnResult() (map[string]any, error) {
+	if !a.sawAny {
+		return nil, ErrEmptyStream
+	}
+	obj := a.result()
+	choice, _ := firstOf(obj["choices"]).(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if message != nil {
+		text, _ := message["content"].(string)
+		calls, _ := message["tool_calls"].([]any)
+		if strings.TrimSpace(text) == "" && len(calls) == 0 {
+			return nil, ErrEmptyStream
+		}
+	}
+	return obj, nil
+}
+
+// firstOf 取数组第一个元素（类型断言写在调用处，这里只做形状兜底）。
+func firstOf(value any) any {
+	if list, ok := value.([]any); ok && len(list) > 0 {
+		return list[0]
+	}
+	return nil
+}
+
 // Aggregate 把上游 SSE 汇聚成一个 chat.completion 对象。
 func Aggregate(r io.Reader, model string) (map[string]any, error) {
 	acc := newAccumulator()
@@ -383,10 +411,7 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 					return nil, &StreamError{KindValue: event.Class, Status: event.Status, Msg: event.Raw,
 						RetryAfterSecs: event.RetryAfterSecs, ServiceUnavailable: event.ServiceUnavailable}
 				case sseDone:
-					if !acc.sawAny {
-						return nil, ErrEmptyStream
-					}
-					return acc.result(), nil
+					return acc.returnResult()
 				case sseChunk:
 					acc.add(event.Chunk)
 				}
@@ -400,18 +425,12 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 					return nil, &StreamError{KindValue: event.Class, Status: event.Status, Msg: event.Raw,
 						RetryAfterSecs: event.RetryAfterSecs, ServiceUnavailable: event.ServiceUnavailable}
 				case sseDone:
-					if !acc.sawAny {
-						return nil, ErrEmptyStream
-					}
-					return acc.result(), nil
+					return acc.returnResult()
 				case sseChunk:
 					acc.add(event.Chunk)
 				}
 			}
-			if !acc.sawAny {
-				return nil, ErrEmptyStream
-			}
-			return acc.result(), nil
+			return acc.returnResult()
 		}
 		if err != nil {
 			return nil, err

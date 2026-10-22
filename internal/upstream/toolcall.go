@@ -27,6 +27,23 @@ const (
 	toolScanHold = len(toolCallOpen) + 1
 )
 
+// toolCallCloses 是认得的收尾标签。
+// 上游模型（DeepSeek 系）会把自己的特殊 token 混进我们约定的格式里，实测写出
+//
+//	<tool_call>{"name":"read_file",...}</｜DSML｜parameter>
+//	</｜DSML｜invoke>
+//	</｜DSML｜tool_call>
+//
+// 只认 </tool_call> 的话这类调用认不出来，调用会被当正文透出、客户端拿不到 tool_calls，
+// Agent 循环直接卡死。
+var toolCallCloses = []string{
+	toolCallClose,
+	"</tool_calls>",
+	"</｜DSML｜tool_call>",
+	"</｜DSML｜tool_calls>",
+	"</｜DSML｜invoke>",
+}
+
 // ToolCall 是一次从正文里还原出来的工具调用。
 type ToolCall struct {
 	Name      string
@@ -34,7 +51,8 @@ type ToolCall struct {
 }
 
 // toolProtocol 把工具声明编译成协议说明；没有工具返回空串（不往正文里加任何东西）。
-func toolProtocol(tools []toolSpec) string {
+func toolProtocol(spec chatRequestSpec) string {
+	tools := spec.Tools
 	if len(tools) == 0 {
 		return ""
 	}
@@ -58,7 +76,32 @@ func toolProtocol(tools []toolSpec) string {
 	b.WriteString("2. 一次回复里需要多个工具时，输出多个 " + toolCallOpen + " 块，不要合并成一个。\n")
 	b.WriteString("3. 不需要调用工具时，正常用自然语言回答，不要输出 " + toolCallOpen + " 标签。\n")
 	b.WriteString("4. 工具结果会以 [工具结果 工具名] 开头的消息给你，据此继续。\n")
+	b.WriteString("5. 在收到 [工具结果 …] 之前，不要说工具已经执行过，也不要编造它的返回内容。\n")
+	// tool_choice 是客户端对本次调用的硬要求：模型看不到它，只能翻译成一句中文说明。
+	if forced := toolChoiceHint(spec.ToolChoice); forced != "" {
+		b.WriteString(forced + "\n")
+	}
 	return b.String()
+}
+
+// toolChoiceHint 把 tool_choice 翻成给模型看的一句话；auto 不需要说。
+func toolChoiceHint(choice any) string {
+	switch tc := choice.(type) {
+	case string:
+		switch tc {
+		case "required", "any":
+			return "6. 本次必须先调用工具，再根据结果回答。"
+		case "none":
+			return "6. 本次不要调用工具，直接用自然语言回答。"
+		}
+	case map[string]any:
+		if fn, ok := tc["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); name != "" {
+				return "6. 本次必须调用工具 " + name + "。"
+			}
+		}
+	}
+	return ""
 }
 
 // toolScanner 增量识别正文里的工具调用标记。
@@ -112,10 +155,10 @@ func (s *toolScanner) drain(data string) (string, []ToolCall) {
 	var calls []ToolCall
 	for {
 		if s.inCall {
-			idx := strings.Index(data, toolCallClose)
+			idx, closeLen := findClose(data)
 			if idx < 0 {
 				// 未闭合：留够尾巴以防标签被切断，其余继续累积。
-				keep := len(toolCallClose) - 1
+				keep := longestClose() - 1
 				if len(data) > keep {
 					s.call.WriteString(data[:len(data)-keep])
 					data = data[len(data)-keep:]
@@ -132,7 +175,7 @@ func (s *toolScanner) drain(data string) (string, []ToolCall) {
 			}
 			s.call.Reset()
 			s.inCall = false
-			data = data[idx+len(toolCallClose):]
+			data = stripResidualCloseTags(data[idx+closeLen:])
 			continue
 		}
 
@@ -169,7 +212,9 @@ func (s *toolScanner) parse(body string) (ToolCall, bool) {
 		Arguments json.RawMessage `json:"arguments"`
 		// 部分模型会把参数摊平到顶层（{"name":"x","cmd":"ls"}），兜住这种写法。
 	}
-	if err := json.Unmarshal([]byte(body), &payload); err != nil || payload.Name == "" {
+	// 只解开头那个 JSON 对象：模型会在它后面接着吐自己的特殊 token
+	// （实测 `</｜DSML｜parameter>`），尾部残渣不算解析失败。
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&payload); err != nil || payload.Name == "" {
 		return ToolCall{}, false
 	}
 	if len(s.allowed) > 0 && !s.allowed[payload.Name] {
@@ -179,7 +224,7 @@ func (s *toolScanner) parse(body string) (ToolCall, bool) {
 	if args == "" || args == "null" {
 		// 摊平写法：把除 name/arguments 以外的字段当参数。
 		var raw map[string]json.RawMessage
-		if json.Unmarshal([]byte(body), &raw) == nil {
+		if json.NewDecoder(strings.NewReader(body)).Decode(&raw) == nil {
 			delete(raw, "name")
 			delete(raw, "arguments")
 			if encoded, err := json.Marshal(raw); err == nil {
@@ -194,6 +239,44 @@ func (s *toolScanner) parse(body string) (ToolCall, bool) {
 		return ToolCall{}, false
 	}
 	return ToolCall{Name: payload.Name, Arguments: args}, true
+}
+
+// stripResidualCloseTags 吃掉调用后面紧接着的一串收尾标签残渣。
+// 模型把原生 invoke/parameter 的尾巴一起吐出来时会有好几条（parameter → invoke →
+// tool_call），只匹配到中间那条的话，剩下的 `</｜DSML｜tool_call>` 会漏进正文。
+func stripResidualCloseTags(data string) string {
+	for {
+		trimmed := strings.TrimLeft(data, " \t\r\n")
+		if strings.HasPrefix(trimmed, "</") || strings.HasPrefix(trimmed, "<｜DSML｜") {
+			if end := strings.Index(trimmed, ">"); end > 0 && end < 64 {
+				data = trimmed[end+1:]
+				continue
+			}
+		}
+		return data
+	}
+}
+
+// findClose 返回最早出现的收尾标签位置与长度；没有返回 -1。
+func findClose(data string) (int, int) {
+	bestIdx, bestLen := -1, 0
+	for _, tag := range toolCallCloses {
+		if i := strings.Index(data, tag); i >= 0 && (bestIdx < 0 || i < bestIdx) {
+			bestIdx, bestLen = i, len(tag)
+		}
+	}
+	return bestIdx, bestLen
+}
+
+// longestClose 是最长收尾标签的字节数（未闭合时要留着尾巴，等下一帧补齐）。
+func longestClose() int {
+	n := 0
+	for _, tag := range toolCallCloses {
+		if len(tag) > n {
+			n = len(tag)
+		}
+	}
+	return n
 }
 
 // partialPrefixLen 返回 data 尾部与 tag 前缀重合的字节数。
